@@ -3,3 +3,9 @@ build/
 .DS_Store
 *.xcodeproj
 .swiftpm/
+
+# Локальная обвязка рабочего процесса, не часть продукта
+.s5d/
+.mcp.json
+.claude/
+AGENTS.md

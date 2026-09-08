@@ -1,7 +1,0 @@
-schema: '1.0'
-gate_commands: {}
-engines: {}
-gate_runner: null
-defaults:
-  tier: standard
-  evidence_retention_days: 90
