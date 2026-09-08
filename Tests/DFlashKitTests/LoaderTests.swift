@@ -15,7 +15,7 @@ import XCTest
 final class LoaderTests: XCTestCase {
     private static let checkpoint = URL(
         fileURLWithPath: NSHomeDirectory()
-    ).appending(path: ".lmstudio/models/incoai/Qwen3.8-27B-DFlash2")
+    ).appending(path: "Library/Application Support/QwenLocal/models/Qwen3.8-27B-DFlash2")
 
     func testLoadsRealCheckpoint() throws {
         guard FileManager.default.fileExists(atPath: Self.checkpoint.path) else {

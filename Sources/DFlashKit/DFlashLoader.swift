@@ -29,7 +29,12 @@ extension DFlashDraftModel {
     /// initialised values, and a drafter with one silently random layer still
     /// produces fluent-looking tokens - the target rejects nearly all of them,
     /// which reads as "speculation does not help here" rather than as a bug.
-    public static func load(directory: URL) throws -> DFlashDraftModel {
+    /// - Parameter quantizeBits: quantise the drafter's linear layers after loading.
+    ///   Off by default: measured here it made drafting slower, not faster (2.18 s -> 2.40 s
+    ///   over 44 rounds), because this drafter's matrices are small enough that the
+    ///   quantised matmul's overhead outweighs the traffic it saves. Kept as an option
+    ///   since that balance flips on larger drafters.
+    public static func load(directory: URL, quantizeBits: Int? = nil) throws -> DFlashDraftModel {
         let configURL = directory.appending(component: "config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             throw DFlashLoaderError.missingConfiguration(directory)
@@ -52,6 +57,13 @@ extension DFlashDraftModel {
 
         let model = DFlashDraftModel(configuration)
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        if let bits = quantizeBits {
+            // The codebooks are gathered by token id, not matmul'd, so quantising them
+            // would corrupt the selector's scores; only the linear layers are eligible.
+            quantize(model: model, groupSize: 64, bits: bits) { path, module in
+                module is Linear && !path.contains("codebook")
+            }
+        }
         eval(model)
         return model
     }

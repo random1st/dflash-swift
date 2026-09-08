@@ -5,7 +5,8 @@ let package = Package(
     name: "dflash-swift",
     platforms: [.macOS(.v14), .iOS(.v16)],
     products: [
-        .library(name: "DFlashKit", targets: ["DFlashKit"])
+        .library(name: "DFlashKit", targets: ["DFlashKit"]),
+        .executable(name: "dflash-bench", targets: ["dflash-bench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
@@ -13,6 +14,10 @@ let package = Package(
         // needed a small patch to the Qwen3.5 backbone (branch dflash-multilayer-tap).
         // Point this back at the upstream URL once that patch is merged.
         .package(path: "../mlx-swift-lm"),
+        // Only the bench executable needs the Hub client and tokenizers; DFlashKit
+        // itself stays free of them so an embedder can bring its own.
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
     targets: [
         .target(
@@ -24,6 +29,17 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            ]
+        ),
+        .executableTarget(
+            name: "dflash-bench",
+            dependencies: [
+                "DFlashKit",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         .testTarget(
