@@ -19,6 +19,15 @@
       }
     },
     {
+      "identity" : "mlx-swift-lm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/random1st/mlx-swift-lm",
+      "state" : {
+        "branch" : "dflash-multilayer-tap",
+        "revision" : "2f6e32ab00c3ec2db81405281b5707575f853005"
+      }
+    },
+    {
       "identity" : "swift-argument-parser",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-argument-parser",
