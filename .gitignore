@@ -9,3 +9,5 @@ build/
 .mcp.json
 .claude/
 AGENTS.md
+
+default.profraw

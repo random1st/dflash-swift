@@ -37,7 +37,15 @@ started = Date()
 let drafter = try DFlashDraftModel.load(directory: drafterDirectory)
 print("  за \(Int(Date().timeIntervalSince(started)))s, блок \(drafter.configuration.blockSize), слои \(drafter.configuration.targetLayerIds)")
 
+// Ядро small-M читает веса один раз на 6–8 строк; в генераторе оно включено по
+// умолчанию, --no-small-m его выключает. Кривую стоимости по ширине меряем на
+// голой модели, поэтому там подмена делается руками: --rows --small-m.
+let smallM = !arguments.contains("--no-small-m")
+
 if CommandLine.arguments.contains("--rows") {
+    if arguments.contains("--small-m") {
+        print("ядро small-M: заменено слоёв \(enableSmallMQuantizedMatmul(in: target))")
+    }
     measureRows(target: target, vocabulary: drafter.configuration.vocabularySize)
     exit(0)
 }
@@ -53,7 +61,8 @@ let capArgument = arguments.firstIndex(of: "--cap").flatMap { index -> Int? in
     arguments.count > index + 1 ? Int(arguments[index + 1]) : nil
 }
 let generator = DFlashSpeculativeGenerator(
-    target: target, drafter: drafter, maximumDraftTokens: capArgument)
+    target: target, drafter: drafter, maximumDraftTokens: capArgument, useSmallMKernel: smallM)
+print("ядро small-M: заменено слоёв \(generator.acceleratedLayers)")
 print("cap \(generator.cap) черновых токенов на раунд, генерирую \(maximumTokens)…")
 
 var produced: [Int] = []

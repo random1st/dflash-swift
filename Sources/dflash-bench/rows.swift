@@ -7,7 +7,9 @@ import MLXLLM
 import MLXLMCommon
 
 func measureRows(target: Qwen35TextModel, vocabulary: Int) {
-    let widths = [1, 2, 4, 8]
+    // 5 и 6 обрамляют порог, с которого ядро small-M включается: если кривая
+    // ломается не там, виновата граница, а не ядро.
+    let widths = [1, 2, 4, 5, 6, 8]
     print("ширина  секунд/проход  относительно одной строки")
     var single = 0.0
     for width in widths {

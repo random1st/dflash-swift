@@ -89,10 +89,20 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
     /// cap only shortens the verified suffix.
     public let cap: Int
 
+    /// How many of the target's projections run on ``SmallMQuantizedMatmul``.
+    /// Zero means the verify pass is on stock kernels and the cap is the narrow one.
+    public let acceleratedLayers: Int
+
+    /// - Parameter useSmallMKernel: swap the target's eligible quantised projections
+    ///   for the small-M kernel. It is what makes a full-width block affordable, and it
+    ///   is why the default cap is the whole block. Only 6-to-8-row forwards take the
+    ///   new path, so single-token decode and prefill through the same model stay bit
+    ///   for bit what they were; pass `false` to leave the model untouched.
     public init(
         target: Qwen35TextModel,
         drafter: DFlashDraftModel,
-        maximumDraftTokens: Int? = nil
+        maximumDraftTokens: Int? = nil,
+        useSmallMKernel: Bool = true
     ) {
         self.target = target
         self.drafter = drafter
@@ -100,15 +110,22 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         // silently mismatches `fc` and produces drafts the target rejects.
         self.bridge = Qwen35Bridge(
             target: target, tapIndices: drafter.configuration.targetLayerIds)
+        self.acceleratedLayers = useSmallMKernel ? enableSmallMQuantizedMatmul(in: target) : 0
+
         let blockDrafts = max(1, drafter.configuration.blockSize - 1)
-        // Verifying the full block is past the point where it pays. On stock MLX kernels a
-        // quantised matmul does not amortise the weight read across a handful of rows: on
-        // Qwen3.8-27B a 1-row pass costs 55 ms, 2 rows 1.14x, 4 rows 1.75x and 8 rows 3.24x.
-        // Acceptance barely grows over that range, so the full block spends 3.24x to collect
-        // 3.29 tokens while four drafts spend 1.75x to collect 3.14 — measured end to end at
-        // 27.7 tok/s against 20.0. A drafter-side kernel that amortised the read would move
-        // this optimum back out to the full block.
-        self.cap = min(maximumDraftTokens ?? min(4, blockDrafts), blockDrafts)
+        // How wide a block pays for itself is decided entirely by whether the verify pass
+        // re-reads the weights per row. On stock kernels it does: a target forward on
+        // Qwen3.8-27B costs 52 ms at 1 row, 1.05x at 2, 1.63x at 4 and 3.07x at 8, so a
+        // full block spends 3.07x to collect ~3.7 accepted tokens and speculation gives
+        // most of its winnings back — 21.6 tok/s at cap 7 against 29.6 at cap 4.
+        //
+        // With the small-M kernel the same curve reads 1.00 / 1.06 / 1.64 / 1.51x: from 6
+        // rows up the weight read is paid once and width is nearly free, so the optimum
+        // moves back out to the whole block — measured 44.5 tok/s at cap 7, against 21.6
+        // for the same cap on stock kernels. Hence: kernel on, draft the full block; kernel
+        // off, stay at four.
+        let defaultCap = acceleratedLayers > 0 ? blockDrafts : min(4, blockDrafts)
+        self.cap = min(maximumDraftTokens ?? defaultCap, blockDrafts)
         drafter.bind(bridge)
     }
 
