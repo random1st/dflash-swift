@@ -32,6 +32,9 @@ public struct DFlashGenerationStatistics: Sendable {
     public var rollbackSeconds: Double = 0
     public var prefillSeconds: Double = 0
 
+    /// Prompt tokens that came from a prefix-cache hit instead of being prefilled.
+    public var reusedPromptTokens: Int = 0
+
     /// Tokens emitted, including the bonus token of every round.
     public let tokens: Int
     public let rounds: [DFlashRound]
@@ -93,6 +96,24 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
     /// Zero means the verify pass is on stock kernels and the cap is the narrow one.
     public let acceleratedLayers: Int
 
+    /// Prompt prefixes kept hot between calls, or nil to prefill every prompt cold.
+    public let prefixCache: PrefixCache?
+
+    /// How far below the end of the prompt a snapshot is taken.
+    ///
+    /// Snapshots cannot be trimmed after the fact (see ``PrefixCache``), so the boundary
+    /// has to be chosen before the prefill runs, and it has to be one the *next* prompt
+    /// will also contain. The tail of a prompt is the least stable part of it: a chat
+    /// template renders the trailing generation prompt one way while the turn is open and
+    /// another once it is closed, so a snapshot taken at the exact end of turn N is not a
+    /// prefix of turn N+1 and would never be hit. Four tokens covers the Qwen templates'
+    /// tails, and leaving them out costs one extra short forward.
+    public static let snapshotSlack = 4
+
+    /// Prompts shorter than this are prefilled cold: their prefill is already brief, and
+    /// an entry that is mostly boilerplate would push out one that carries a real context.
+    public static let minimumCachedPrompt = 64
+
     /// - Parameter useSmallMKernel: swap the target's eligible quantised projections
     ///   for the small-M kernel. It is what makes a full-width block affordable, and it
     ///   is why the default cap is the whole block. Only 6-to-8-row forwards take the
@@ -102,10 +123,12 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         target: Qwen35TextModel,
         drafter: DFlashDraftModel,
         maximumDraftTokens: Int? = nil,
-        useSmallMKernel: Bool = true
+        useSmallMKernel: Bool = true,
+        prefixCache: PrefixCache? = nil
     ) {
         self.target = target
         self.drafter = drafter
+        self.prefixCache = prefixCache
         // The tap order comes from the drafter's own config: any other order
         // silently mismatches `fc` and produces drafts the target rejects.
         self.bridge = Qwen35Bridge(
@@ -165,34 +188,57 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         guard !prompt.isEmpty else { throw DFlashGenerationError.emptyPrompt }
         let start = Date()
 
-        let targetCache = try target.newCache(parameters: nil)
-        let draftCache = drafter.makeCache()
         let maskToken = Int32(drafter.configuration.maskTokenId)
         let blockSize = drafter.configuration.blockSize
 
         // --- prefill ---
-        let promptTokens = MLXArray(prompt.map { Int32($0) }).reshaped(1, prompt.count)
-        let prefill = target(
-            LMInput.Text(tokens: promptTokens), cache: targetCache,
-            state: bridge.requestState())
-        guard let prefillState = prefill.state, let promptFused = bridge.fuse(prefillState) else {
-            throw DFlashGenerationError.missingTapStates
+        var targetCache: [any KVCache]
+        var draftCache: [BaseKVCache]
+        // The fused row of the last token already in the caches. Context rows lag their
+        // token by one position, so this one belongs to no cache yet: it is the context
+        // for whatever token comes next.
+        var carried: MLXArray?
+        var prefilled = 0
+        var reused = 0
+
+        if let restored = prefixCache?.lookup(prompt: prompt) {
+            targetCache = restored.target
+            draftCache = restored.drafter
+            carried = restored.context
+            prefilled = restored.tokenCount
+            reused = restored.tokenCount
+        } else {
+            targetCache = try target.newCache(parameters: nil)
+            draftCache = drafter.makeCache()
+            // Snapshot first, then finish the prompt: an entry cannot be trimmed down to a
+            // boundary afterwards, so the prefill is split at the boundary instead.
+            if let prefixCache, prompt.count >= Self.minimumCachedPrompt {
+                let boundary = prompt.count - Self.snapshotSlack
+                let head = Array(prompt[..<boundary])
+                carried = try advance(
+                    tokens: head, targetCache: targetCache, draftCache: draftCache,
+                    carried: nil
+                ).context
+                prefilled = boundary
+                prefixCache.store(
+                    tokens: head, target: targetCache, drafter: draftCache, context: carried!)
+            }
         }
+
+        let tail = Array(prompt[prefilled...])
+        let prefill = try advance(
+            tokens: tail, targetCache: targetCache, draftCache: draftCache, carried: carried)
+        var pendingContext = prefill.context
 
         var pending = argMax(prefill.logits[0, -1], axis: -1).item(Int.self)
         var emitted = [pending]
         onToken(pending)
 
-        // The drafter's context row at position i pairs with the token at i + 1,
-        // so the prompt is appended shifted by one: everything but the last row
-        // goes into the cache now, and that last row rides into the first round
-        // as the context for the anchor.
-        var pendingContext = promptFused[0..., (prompt.count - 1)..., 0...]
-        if prompt.count > 1 {
-            drafter.appendContext(
-                drafter.projectContext(promptFused[0..., ..<(prompt.count - 1), 0...]),
-                cache: draftCache)
-        }
+        // What the caches hold, which is not what was emitted: a round commits its anchor
+        // and its accepted drafts, while the bonus token it emits only enters the cache as
+        // the next round's anchor. Tracked so the state at the end of the reply can be
+        // remembered under exactly the tokens that produced it.
+        var cached = prompt
 
         var rounds: [DFlashRound] = []
         var draftSeconds = 0.0
@@ -230,28 +276,18 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             let accepted = outcome.accepted
             rounds.append(DFlashRound(proposed: cap, accepted: accepted))
 
-            // Roll the target back to [anchor + accepted]: the bonus token is the
-            // target's own next prediction, so it is committed without being in
-            // this round's cache.
-            rollbackGatedDeltaRound(
-                cache: targetCache,
-                captures: verified.state?[mtpGatedDeltaCapturesKey] ?? [],
-                width: cap + 1,
-                keep: accepted + 1)
-            rollbackSeconds += Date().timeIntervalSince(mark)
-
             guard let verifiedState = verified.state,
                 let verifiedFused = bridge.fuse(verifiedState)
             else {
                 throw DFlashGenerationError.missingTapStates
             }
-            // Context for the next round: the rows of the positions that stayed.
-            pendingContext = verifiedFused[0..., ..<(accepted + 1), 0...]
 
             let committed =
                 outcome.proposals[0 ..< accepted] + [outcome.targetTokens[accepted]]
+            var handed = 0
             for token in committed {
                 emitted.append(token)
+                handed += 1
                 onToken(token)
                 pending = token
                 if stopTokens.contains(token) {
@@ -260,12 +296,75 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
                 }
                 if emitted.count >= maximumTokens { break }
             }
+
+            // Roll the target back to the tokens that were actually handed out, which is
+            // usually [anchor + accepted] - the bonus token is the target's own next
+            // prediction and is committed without being in this round's cache. A round cut
+            // short by a stop token or by the budget keeps less: leaving the unhanded tail
+            // in the caches would make their state describe a reply nobody was shown, and
+            // the snapshot taken at the end of this generation would then be filed under
+            // tokens no later prompt contains.
+            mark = Date()
+            let keep = min(handed, accepted) + 1
+            rollbackGatedDeltaRound(
+                cache: targetCache,
+                captures: verified.state?[mtpGatedDeltaCapturesKey] ?? [],
+                width: cap + 1,
+                keep: keep)
+            rollbackSeconds += Date().timeIntervalSince(mark)
+
+            // Context for the next round: the rows of the positions that stayed.
+            pendingContext = verifiedFused[0..., ..<keep, 0...]
+            cached.append(Int(anchor))
+            cached.append(contentsOf: outcome.proposals[0 ..< (keep - 1)])
+        }
+
+        // The reply is the expensive half of the next turn's prompt, and the caches are
+        // holding it right now. Remembering it here is what turns "the first turn is slow"
+        // into "only the first turn is slow": measured, the next turn's prompt does contain
+        // this one plus the whole reply.
+        //
+        // `cached` is exactly what the caches hold, and every token in it was handed to the
+        // caller, so it is a prefix of any transcript that continues this reply.
+        if let prefixCache, cached.count > prompt.count {
+            prefixCache.store(
+                tokens: cached, target: targetCache, drafter: draftCache,
+                context: pendingContext[0..., (pendingContext.dim(1) - 1)..., 0...])
         }
 
         return DFlashGenerationStatistics(
             draftSeconds: draftSeconds, verifySeconds: verifySeconds,
             rollbackSeconds: rollbackSeconds, prefillSeconds: prefillSeconds,
+            reusedPromptTokens: reused,
             tokens: emitted.count, rounds: rounds, seconds: Date().timeIntervalSince(start))
+    }
+
+    /// Forwards `tokens` through the target, appends the drafter contexts they complete,
+    /// and hands back the row that has to be carried into whatever comes next.
+    ///
+    /// The shift is the whole subtlety: the fused row at position `i` is the drafter's
+    /// context for the token at `i + 1`. So every row but the last is appendable now -
+    /// preceded by `carried`, the row left over from the tokens already in the caches -
+    /// and the last row is returned to be carried in turn.
+    private func advance(
+        tokens: [Int], targetCache: [any KVCache], draftCache: [BaseKVCache],
+        carried: MLXArray?
+    ) throws -> (context: MLXArray, logits: MLXArray) {
+        let ids = MLXArray(tokens.map { Int32($0) }).reshaped(1, tokens.count)
+        let output = target(
+            LMInput.Text(tokens: ids), cache: targetCache, state: bridge.requestState())
+        guard let state = output.state, let fused = bridge.fuse(state) else {
+            throw DFlashGenerationError.missingTapStates
+        }
+
+        var rows = fused[0..., ..<(tokens.count - 1), 0...]
+        if let carried {
+            rows = concatenated([carried, rows], axis: 1)
+        }
+        if rows.dim(1) > 0 {
+            drafter.appendContext(drafter.projectContext(rows), cache: draftCache)
+        }
+        return (fused[0..., (tokens.count - 1)..., 0...], output.logits)
     }
 
     // MARK: - Accept test
