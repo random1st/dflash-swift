@@ -1,0 +1,19 @@
+DFlashKit - a Swift port of the DFlash / DFlash 2 block-diffusion speculative
+decoding drafter for MLX.
+
+This work is a derivative of the following, and carries their notices:
+
+1. z-lab/dflash - the DFlash drafter model (MIT License, Copyright (c) 2026 Z Lab).
+   Upstream: https://github.com/z-lab/dflash
+   Paper: "DFlash: Block Diffusion for Flash Speculative Decoding", Chen et al.,
+   arXiv:2602.06036.
+
+2. sgl-project/sglang - the DFlash 2 components, grouped dynamic convolution and
+   candidate selector (Apache License 2.0).
+   Files: srt/models/dflash.py, srt/speculative/dflash_worker_v2.py
+
+3. ARahim3/mlx-dspark - the MLX reference this port was written against
+   (MIT License), specifically mlx_dspark/dflash_model.py, which vendored (1)
+   and ported (2).
+
+DFlash 2 checkpoints are published by Inco AI under Apache License 2.0.

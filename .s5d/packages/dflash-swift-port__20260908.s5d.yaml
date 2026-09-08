@@ -1,0 +1,160 @@
+s5d: '1.0'
+id: dflash-swift-port
+version: 1.0.0
+product: dflash-swift
+tier: standard
+allow_update: true
+meta:
+  title: dflash-swift-port
+  authors: []
+  date: 2026-09-08
+  tickets: []
+  adrs: []
+  renames: []
+context: |
+  ## Problem
+
+  ## Goal
+
+  ## Privacy
+  Classification: Internal
+workflow:
+  mode: plan
+  target_architecture:
+    summary: Describe the steady-state design this change should reach
+    invariants: []
+  delivery_strategy:
+    summary: Describe how this change moves current code toward the target architecture
+    rationale: null
+  resources: null
+  role_map:
+    implementer: coder
+    owner: human
+    verifier: reviewer
+    reviewer: reviewer
+  review_policy:
+    cross_model_required: false
+    required_on: []
+  structure_outline: null
+  execution_mode:
+    engine: manual
+    max_iterations: null
+    stop_conditions:
+    - Phase acceptance reached
+    - Approved scope exhausted
+    - New decision required
+  phases:
+  - id: prototype
+    title: Prototype
+    scope: Reduce unknowns before committed implementation
+    roles:
+    - owner
+    - implementer
+    acceptance:
+    - Critical feasibility questions answered
+    - Telemetry approach identified
+    rollback:
+    - Discard spike output if assumptions fail
+  - id: build
+    title: Build
+    scope: Implement approved scope and pass local gates
+    roles:
+    - implementer
+    - reviewer
+    acceptance:
+    - Declared gates pass
+    - Change matches approved scope
+    rollback:
+    - Revert or reconcile if gates or review fail
+  - id: measure
+    title: Measure
+    scope: Collect telemetry and close the loop with an explicit verdict
+    roles:
+    - owner
+    - verifier
+    acceptance:
+    - Telemetry collected against success criteria
+    - Outcome verdict recorded
+    rollback:
+    - Iterate or kill if evidence stays weak
+artifacts:
+  products:
+  - id: dflash-swift
+    name: dflash-swift
+    organization: null
+  domains:
+  - id: dom.dflash-swift.core
+    product: dflash-swift
+    name: dflash-swift core domain
+    classification: supporting
+    description: Scaffold default — rename or split into real bounded contexts
+    team: null
+    maturity_level: null
+    product_criticality: null
+    owner: null
+  capabilities:
+  - id: cap.dflash-swift-port
+    domain: dom.dflash-swift.core
+    name: dflash swift port
+    description: null
+    since: null
+  entities: []
+  features:
+  - id: dflash-swift-port
+    product: dflash-swift
+    name: dflash-swift-port
+    description: null
+  use_cases: []
+  systems:
+  - id: sys.dflash-swift
+    product: dflash-swift
+    name: dflash-swift
+  containers:
+  - id: ctr.dflash-swift.app
+    system: sys.dflash-swift
+    name: dflash-swift app
+    technology: null
+  components:
+  - id: comp.dflash-swift-port
+    feature: dflash-swift-port
+    domain: dom.dflash-swift.core
+    container: ctr.dflash-swift.app
+    name: dflash swift port component
+    paths:
+    - TODO-set-source-paths/
+    product_criticality: null
+    owner: null
+  roles: []
+  concerns: []
+  metrics: []
+  supersystems: []
+  transports: []
+links:
+  feature_to_domain:
+  - domain: dom.dflash-swift.core
+    feature: dflash-swift-port
+  use_case_to_capability: []
+  use_case_to_entity: []
+  component_to_capability:
+  - component: comp.dflash-swift-port
+    capability: cap.dflash-swift-port
+  component_to_entity: []
+  container_to_capability: []
+  concern_to_metric: []
+  component_to_container: []
+  edges: []
+  depends_on: []
+  entity_relations: []
+  capability_to_entity: []
+  capability_to_concern: []
+contracts: []
+gates:
+- kind: schema
+- kind: graph
+roc: null
+problem: null
+hypotheses: []
+decision: null
+note_rationale: null
+expires_at: null
+auto_noted: false

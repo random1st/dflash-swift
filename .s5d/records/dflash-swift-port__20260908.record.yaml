@@ -1,0 +1,18 @@
+revision: 1
+spec_ref: dflash-swift-port__20260908.s5d.yaml
+spec_sha256: sha256:ff2469bc2d92fdc143e7b70427576a7fbcd0f759f8ae662194cce8748b8f4e14
+status: proposed
+sync_status: unknown
+status_history:
+- status: proposed
+  timestamp: 2026-09-08T03:00:42.514509+00:00
+active_phase: null
+phase_history: []
+phase_runs: []
+approvals: []
+preview: null
+reflection: null
+gate_results: []
+decision: null
+verified_by: null
+drift_tolerance: null
