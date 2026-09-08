@@ -37,6 +37,11 @@ started = Date()
 let drafter = try DFlashDraftModel.load(directory: drafterDirectory)
 print("  за \(Int(Date().timeIntervalSince(started)))s, блок \(drafter.configuration.blockSize), слои \(drafter.configuration.targetLayerIds)")
 
+if CommandLine.arguments.contains("--rows") {
+    measureRows(target: target, vocabulary: drafter.configuration.vocabularySize)
+    exit(0)
+}
+
 let prompt = "Write a Python function that parses a semver string into a tuple."
 let messages = [Chat.Message.user(prompt)]
 let userInput = UserInput(chat: messages, additionalContext: ["enable_thinking": false])
@@ -44,7 +49,11 @@ let input = try await context.processor.prepare(input: userInput)
 let tokens = input.text.tokens.asArray(Int.self)
 print("промпт: \(tokens.count) токенов")
 
-let generator = DFlashSpeculativeGenerator(target: target, drafter: drafter)
+let capArgument = arguments.firstIndex(of: "--cap").flatMap { index -> Int? in
+    arguments.count > index + 1 ? Int(arguments[index + 1]) : nil
+}
+let generator = DFlashSpeculativeGenerator(
+    target: target, drafter: drafter, maximumDraftTokens: capArgument)
 print("cap \(generator.cap) черновых токенов на раунд, генерирую \(maximumTokens)…")
 
 var produced: [Int] = []

@@ -101,7 +101,14 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         self.bridge = Qwen35Bridge(
             target: target, tapIndices: drafter.configuration.targetLayerIds)
         let blockDrafts = max(1, drafter.configuration.blockSize - 1)
-        self.cap = min(maximumDraftTokens ?? blockDrafts, blockDrafts)
+        // Verifying the full block is past the point where it pays. On stock MLX kernels a
+        // quantised matmul does not amortise the weight read across a handful of rows: on
+        // Qwen3.8-27B a 1-row pass costs 55 ms, 2 rows 1.14x, 4 rows 1.75x and 8 rows 3.24x.
+        // Acceptance barely grows over that range, so the full block spends 3.24x to collect
+        // 3.29 tokens while four drafts spend 1.75x to collect 3.14 — measured end to end at
+        // 27.7 tok/s against 20.0. A drafter-side kernel that amortised the read would move
+        // this optimum back out to the full block.
+        self.cap = min(maximumDraftTokens ?? min(4, blockDrafts), blockDrafts)
         drafter.bind(bridge)
     }
 
