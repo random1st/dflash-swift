@@ -30,8 +30,13 @@ enum SmallMQuantizedMatmul {
     /// net-negative in-model upstream), M=6 is the first clear win. A constant of
     /// (chip x MLX version) - revisit after an MLX upgrade.
     static let minimumRows = 6
-    /// One MMA tile.
-    static let maximumRows = 8
+    /// Two MMA tiles. Eight was one tile, which was enough while every drafter here used
+    /// an eight-token block - but the MoE drafter drafts sixteen, so its verify pass was
+    /// exactly one row too wide to qualify and ran entirely on the stock op.
+    static let maximumRows = 16
+
+    /// Rows one MMA tile covers. A pass narrower than this pays for one tile, not two.
+    static let rowsPerTile = 8
     /// Below this the grid is too few threadgroups to occupy the GPU.
     static let minimumOutputFeatures = 4096
     /// The K-loop strides 64 values per simdgroup over a K/8 slice, so K must be a
@@ -66,7 +71,27 @@ enum SmallMQuantizedMatmul {
             """,
     ]
 
-    private static let source = """
+    /// The kernel body, in a one-tile and a two-tile form.
+    ///
+    /// Both read and dequantise the weights exactly once; the second tile only adds another
+    /// `simdgroup_multiply_accumulate` against the same `B`. That is the whole point - the
+    /// weight traffic is what decode is bound by, so sixteen rows cost what eight do plus
+    /// the arithmetic nobody notices.
+    private static func source(tiles: Int) -> String {
+        let secondTileMMA =
+            tiles == 2
+            ? """
+                            simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);
+                            simdgroup_multiply_accumulate(C1, A1, B, C1);
+                """
+            : ""
+        let secondTileDeclare =
+            tiles == 2 ? "simdgroup_matrix<float, 8, 8> C1 = simdgroup_matrix<float, 8, 8>(0);" : ""
+        let secondTileStore =
+            tiles == 2 ? "simdgroup_store(C1, red + 512 + sg * 64, 8);" : ""
+        let secondTileLoad = tiles == 2 ? "simdgroup_matrix<bfloat16_t, 8, 8> A1;" : ""
+
+        return """
             const int K = KD, N = ND, M = MD;
             const int KPS = KD / 8;                 // K-span per simdgroup (split-K)
 
@@ -81,9 +106,10 @@ enum SmallMQuantizedMatmul {
             // staging keeps threadgroup memory small and, more importantly, the critical
             // path short.
             threadgroup bfloat16_t bs[8 * 512];     // per-simdgroup 64k x 8n dequant stage
-            threadgroup float red[8 * 64];          // cross-simdgroup reduction
+            threadgroup float red[8 * 64 * \(tiles)];   // cross-simdgroup reduction
 
-            simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0);
+            simdgroup_matrix<float, 8, 8> C0 = simdgroup_matrix<float, 8, 8>(0);
+            \(secondTileDeclare)
             threadgroup bfloat16_t* bt = bs + sg * 512;
 
             // Split-K: the 8 simdgroups each walk 1/8 of K in short serial loops. (A prior
@@ -107,38 +133,58 @@ enum SmallMQuantizedMatmul {
                 }
                 simdgroup_barrier(mem_flags::mem_threadgroup);
 
-                simdgroup_matrix<bfloat16_t, 8, 8> A, B;
+                simdgroup_matrix<bfloat16_t, 8, 8> A0, B;
+                \(secondTileLoad)
                 for (int kt = 0; kt < 8; ++kt) {
-                    simdgroup_load(A, x + ka + kt * 8, K);   // x rows 0..7 (padded to 8)
                     simdgroup_load(B, bt + kt * 64, 8);
-                    simdgroup_multiply_accumulate(C, A, B, C);
+                    simdgroup_load(A0, x + ka + kt * 8, K);   // x rows 0..7
+                    simdgroup_multiply_accumulate(C0, A0, B, C0);
+        \(secondTileMMA)
                 }
                 simdgroup_barrier(mem_flags::mem_threadgroup);
             }
 
-            simdgroup_store(C, red + sg * 64, 8);
+            simdgroup_store(C0, red + sg * 64, 8);
+            \(secondTileStore)
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // sum the 8 split-K partials and write out
-            for (int i = (int)tid; i < 64; i += 256) {
-                int m = i >> 3, j = i & 7;
+            for (int i = (int)tid; i < 64 * \(tiles); i += 256) {
+                int t = i >> 6;                     // which MMA tile
+                int r = i & 63;                     // position inside it
+                int m = t * 8 + (r >> 3);
+                int j = r & 7;
                 int n = n0 + j;
                 if (m < M && n < N) {
                     float v = 0.0f;
-                    for (int q = 0; q < 8; ++q) v += red[q * 64 + i];
+                    for (int q = 0; q < 8; ++q) v += red[t * 512 + q * 64 + r];
                     out[(size_t)m * N + n] = (bfloat16_t)v;
                 }
             }
         """
-
-    /// JIT compilation is per kernel object, so the two widths are built once and held.
-    private static let kernels: [Int: MLX.MLXFast.MLXFastKernel] = unpack.mapValues { body in
-        MLX.MLXFast.metalKernel(
-            name: "dflash_qmm_mma",
-            inputNames: ["x", "w", "sc", "bi"],
-            outputNames: ["out"],
-            source: source.replacingOccurrences(of: "__UNPACK__", with: body))
     }
+
+    /// JIT compilation is per kernel object, so each (width, tile count) pair is built once
+    /// and held: two quantisation widths by one or two tiles.
+    private struct Variant: Hashable {
+        let bits: Int
+        let tiles: Int
+    }
+
+    private static let kernels: [Variant: MLX.MLXFast.MLXFastKernel] = {
+        var built: [Variant: MLX.MLXFast.MLXFastKernel] = [:]
+        for (bits, body) in unpack {
+            for tiles in 1 ... 2 {
+                built[Variant(bits: bits, tiles: tiles)] = MLX.MLXFast.metalKernel(
+                    name: "dflash_qmm_mma_\(bits)_\(tiles)",
+                    inputNames: ["x", "w", "sc", "bi"],
+                    outputNames: ["out"],
+                    source: source(tiles: tiles)
+                        .replacingOccurrences(of: "__UNPACK__", with: body))
+            }
+        }
+        return built
+    }()
 
     /// Can this layer's shape and quantisation format run on the kernel at all?
     ///
@@ -146,7 +192,7 @@ enum SmallMQuantizedMatmul {
     /// is answered once when the model is swapped rather than per forward.
     static func isEligible(_ layer: QuantizedLinear) -> Bool {
         guard layer.mode == .affine, layer.biases != nil else { return false }
-        guard kernels[layer.bits] != nil, layer.groupSize == requiredGroupSize else {
+        guard unpack[layer.bits] != nil, layer.groupSize == requiredGroupSize else {
             return false
         }
         let (outputFeatures, inputFeatures) = layer.shape
@@ -154,12 +200,18 @@ enum SmallMQuantizedMatmul {
             && inputFeatures % inputFeatureMultiple == 0
     }
 
-    /// `x[8, K] @ dequant(w)[K, N]`, keeping the first `rows` result rows.
+    /// Tiles needed to cover `rows`: one up to eight, two beyond. A narrow pass must not
+    /// pay for a tile it does not fill.
+    static func tiles(for rows: Int) -> Int {
+        rows <= rowsPerTile ? 1 : 2
+    }
+
+    /// `x[tiles * 8, K] @ dequant(w)[K, N]`, keeping the first `rows` result rows.
     static func apply(
         x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         rows: Int, outputFeatures: Int, inputFeatures: Int, bits: Int
     ) -> MLXArray {
-        guard let kernel = kernels[bits] else {
+        guard let kernel = kernels[Variant(bits: bits, tiles: tiles(for: rows))] else {
             fatalError("no small-M quantised matmul kernel for \(bits)-bit weights")
         }
         return kernel(
@@ -216,15 +268,15 @@ public final class SmallMQuantizedLinear: QuantizedLinear {
         let inputFeatures = shape[shape.count - 1]
         let outputFeatures = weight.dim(0)
         var flat = x.reshaped(rows, inputFeatures)
-        if rows < SmallMQuantizedMatmul.maximumRows {
-            // The kernel reads a full 8-row MMA tile from device; the padding rows are
-            // computed and then dropped by the `m < M` guard on the store.
+        let padded =
+            SmallMQuantizedMatmul.tiles(for: rows) * SmallMQuantizedMatmul.rowsPerTile
+        if rows < padded {
+            // The kernel reads whole MMA tiles from device; the padding rows are computed
+            // and then dropped by the `m < M` guard on the store.
             flat = concatenated(
                 [
                     flat,
-                    MLXArray.zeros(
-                        [SmallMQuantizedMatmul.maximumRows - rows, inputFeatures],
-                        dtype: .bfloat16),
+                    MLXArray.zeros([padded - rows, inputFeatures], dtype: .bfloat16),
                 ], axis: 0)
         }
 

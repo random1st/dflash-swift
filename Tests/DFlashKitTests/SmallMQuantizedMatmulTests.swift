@@ -144,11 +144,11 @@ final class SmallMQuantizedMatmulTests: XCTestCase {
     }
 
     func testRowCountsOutsideTheWindowReturnTheStockResult() {
-        // Below M=6 the stock GEMV path wins and above M=8 the single MMA tile cannot
-        // hold the rows, so both must fall through unchanged - bit for bit.
+        // Below M=6 the stock GEMV path wins, and above M=16 the two MMA tiles cannot hold
+        // the rows, so both must fall through unchanged - bit for bit.
         let stock = makeLayer(bits: 4)
         let fast = SmallMQuantizedLinear(stock)
-        for rows in [1, 3, 5, 9, 16] {
+        for rows in [1, 3, 5, 17, 24, 32] {
             let x = input(rows: rows)
             XCTAssertTrue((stock(x) .== fast(x)).all().item(Bool.self), "M=\(rows)")
         }
