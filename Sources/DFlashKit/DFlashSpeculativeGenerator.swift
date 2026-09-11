@@ -92,6 +92,44 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
     /// cap only shortens the verified suffix.
     public let cap: Int
 
+    /// Whether the round width follows the drafter's measured hit rate.
+    ///
+    /// A fixed cap assumes the drafter matches the target. It often does not: z-lab's
+    /// drafter for Qwen3.6-35B-A3B lands 7.08 accepted tokens per round on the stock
+    /// weights and 3.74 on an abliterated variant of them, and every drafted token beyond
+    /// what gets accepted is a verified row paid for and thrown away. On a MoE those rows
+    /// are not free - a wider block selects a wider union of experts, which is real weight
+    /// traffic - so the cost of guessing high is paid twice.
+    ///
+    /// Measured on the abliterated model, three interleaved rounds: cap 7 gives 124.8
+    /// tok/s, cap 9 gives 117.8, cap 15 gives 94.0. The best cap sits about three above
+    /// the accepted mean, which is where the extra rows still have a chance of paying and
+    /// have not yet started buying experts nobody reads.
+    public let adaptiveWidth: Bool
+
+    /// How far past the running accepted mean to keep drafting, before the result is
+    /// snapped to a tile boundary.
+    private static let widthHeadroom = 3
+
+    /// The width to draft next, given how many tokens are being accepted.
+    ///
+    /// Two rules, both measured. Draft about three past the accepted mean, because that is
+    /// where the extra rows still have a chance of being kept. Then round the verify pass
+    /// up to a whole MMA tile: the kernel computes all eight rows of a tile whether or not
+    /// they were asked for, so a width of seven rows costs what eight costs and returns
+    /// less. The sweep shows it plainly - on the abliterated MoE, caps of 3, 5, 7 (four,
+    /// six and eight rows) beat 4, 6, 9 around them, and cap 7 wins outright.
+    ///
+    /// Reproduces every optimum measured here: 3.74 accepted picks cap 7 (best of the
+    /// sweep at 124.8 tok/s), 4.10 picks 7 (best), 7.08 picks 15 (best).
+    static func width(forAccepted mean: Double, blockDrafts: Int) -> Int {
+        let wanted = Int(mean.rounded()) + widthHeadroom
+        let rows = max(wanted + 1, SmallMQuantizedMatmul.rowsPerTile)
+        let snapped = ((rows + SmallMQuantizedMatmul.rowsPerTile - 1)
+            / SmallMQuantizedMatmul.rowsPerTile) * SmallMQuantizedMatmul.rowsPerTile
+        return max(4, min(snapped - 1, blockDrafts))
+    }
+
     /// How many of the target's projections run on ``SmallMQuantizedMatmul``.
     /// Zero means the verify pass is on stock kernels and the cap is the narrow one.
     public let acceleratedLayers: Int
@@ -149,6 +187,9 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         // off, stay at four.
         let defaultCap = acceleratedLayers > 0 ? blockDrafts : min(4, blockDrafts)
         self.cap = min(maximumDraftTokens ?? defaultCap, blockDrafts)
+        // An explicit cap is an instruction, not a starting point: the bench pins it to
+        // measure one width, and a caller who names a number means that number.
+        self.adaptiveWidth = maximumDraftTokens == nil
         drafter.bind(bridge)
     }
 
@@ -247,6 +288,15 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         let prefillSeconds = Date().timeIntervalSince(start)
         var stopped = stopTokens.contains(pending)
 
+        // Start at one tile and grow, rather than starting at the whole block. A drafter
+        // that matches its target climbs back to the full block within a few rounds, and
+        // one that does not never pays for the wide rounds it would have spent learning
+        // that. It also keeps the first generation from compiling a second kernel variant
+        // for a width it abandons.
+        var roundCap =
+            adaptiveWidth ? min(SmallMQuantizedMatmul.rowsPerTile - 1, cap) : cap
+        var acceptedTotal = 0
+
         while emitted.count < maximumTokens && !stopped {
             let anchor = Int32(pending)
             // The block is [anchor] + mask slots; the drafter reads its logits at
@@ -256,14 +306,14 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             var mark = Date()
             let proposals = drafter.selectBlock(
                 block, fusedTargetHidden: pendingContext, cache: draftCache,
-                cap: cap, anchorId: anchor)
+                cap: roundCap, anchorId: anchor)
             // The draft is lazy until something forces it; without this the draft cost
             // would be charged to whichever phase happens to evaluate first.
             eval(proposals)
             draftSeconds += Date().timeIntervalSince(mark)
 
             mark = Date()
-            let verifyIds = concatenated([MLXArray([anchor]), proposals]).reshaped(1, cap + 1)
+            let verifyIds = concatenated([MLXArray([anchor]), proposals]).reshaped(1, roundCap + 1)
             var verifyState = bridge.requestState()
             verifyState[mtpGatedDeltaCaptureFlagKey] = true
             let verified = target(
@@ -274,7 +324,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             verifySeconds += Date().timeIntervalSince(mark)
             mark = Date()
             let accepted = outcome.accepted
-            rounds.append(DFlashRound(proposed: cap, accepted: accepted))
+            rounds.append(DFlashRound(proposed: roundCap, accepted: accepted))
 
             guard let verifiedState = verified.state,
                 let verifiedFused = bridge.fuse(verifiedState)
@@ -309,7 +359,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             rollbackGatedDeltaRound(
                 cache: targetCache,
                 captures: verified.state?[mtpGatedDeltaCapturesKey] ?? [],
-                width: cap + 1,
+                width: roundCap + 1,
                 keep: keep)
             rollbackSeconds += Date().timeIntervalSince(mark)
 
@@ -317,6 +367,14 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             pendingContext = verifiedFused[0..., ..<keep, 0...]
             cached.append(Int(anchor))
             cached.append(contentsOf: outcome.proposals[0 ..< (keep - 1)])
+
+            // Next round's width follows the hit rate this drafter is actually achieving
+            // on these weights, which is the thing a fixed cap cannot know in advance.
+            acceptedTotal += accepted
+            if adaptiveWidth {
+                let mean = Double(acceptedTotal) / Double(rounds.count)
+                roundCap = Self.width(forAccepted: mean, blockDrafts: cap)
+            }
         }
 
         // The reply is the expensive half of the next turn's prompt, and the caches are

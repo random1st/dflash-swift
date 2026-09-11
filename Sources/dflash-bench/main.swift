@@ -86,6 +86,11 @@ func report(_ statistics: DFlashGenerationStatistics, _ label: String) {
     print("  токенов:            \(statistics.tokens)")
     print("  раундов:            \(statistics.rounds.count)")
     print(String(format: "  принято на раунд:   %.2f", statistics.meanAcceptedPerRound))
+    let widths = statistics.rounds.map(\.proposed)
+    if let lo = widths.min(), let hi = widths.max() {
+        let mean = Double(widths.reduce(0, +)) / Double(max(widths.count, 1))
+        print(String(format: "  ширина черновика:   %.1f (от %d до %d)", mean, lo, hi))
+    }
     print(String(format: "  секунд:             %.2f", statistics.seconds))
     print(String(format: "  токенов в секунду:  %.2f", Double(statistics.tokens) / statistics.seconds))
     print(String(format: "  префилл:            %.2fs", statistics.prefillSeconds))
