@@ -34,7 +34,13 @@ else {
 
 print("загружаю драфт \(drafterDirectory.lastPathComponent)…")
 started = Date()
-let drafter = try DFlashDraftModel.load(directory: drafterDirectory)
+// --quant-drafter 4|8 квантует линейные слои драфтера: черновление занимает пятую часть
+// раунда, и вопрос в том, окупается ли меньший трафик весов накладными расходами
+// квантованного matmul на маленьких матрицах.
+let quantBits = arguments.firstIndex(of: "--quant-drafter").flatMap { index -> Int? in
+    arguments.count > index + 1 ? Int(arguments[index + 1]) : nil
+}
+let drafter = try DFlashDraftModel.load(directory: drafterDirectory, quantizeBits: quantBits)
 print("  за \(Int(Date().timeIntervalSince(started)))s, блок \(drafter.configuration.blockSize), слои \(drafter.configuration.targetLayerIds)")
 
 // Ядро small-M читает веса один раз на 6–8 строк; в генераторе оно включено по
@@ -50,12 +56,19 @@ if CommandLine.arguments.contains("--rows") {
     exit(0)
 }
 
-let prompt = "Write a Python function that parses a semver string into a tuple."
+// --prompt меняет вопрос: одна модель на одном промпте может выбрать ответ, который
+// драфтится хуже (регулярка вместо split), и цифра тогда про ответ, а не про модель.
+let prompt = arguments.firstIndex(of: "--prompt").flatMap { index -> String? in
+    arguments.count > index + 1 ? arguments[index + 1] : nil
+} ?? "Write a Python function that parses a semver string into a tuple."
 // --long повторяет вопрос, пока промпт не станет длинным: на коротком префилл и так
 // доли секунды, и prefix-кэшу нечего экономить.
 let repeats = arguments.contains("--long") ? 40 : 1
 let messages = (0 ..< repeats).map { _ in Chat.Message.user(prompt) }
-let userInput = UserInput(chat: messages, additionalContext: ["enable_thinking": false])
+// --think включает рассуждение: z-lab меряет драфтер именно так, и текст рассуждений
+// может быть тем, на чём он обучен. С выключенным thinking проза — другое распределение.
+let thinking = arguments.contains("--think")
+let userInput = UserInput(chat: messages, additionalContext: ["enable_thinking": thinking])
 let input = try await context.processor.prepare(input: userInput)
 let tokens = input.text.tokens.asArray(Int.self)
 print("промпт: \(tokens.count) токенов")
@@ -98,10 +111,63 @@ func report(_ statistics: DFlashGenerationStatistics, _ label: String) {
     print(String(format: "  черновление:        %.2fs", statistics.draftSeconds))
     print(String(format: "  проверка:           %.2fs", statistics.verifySeconds))
     print(String(format: "  откат:              %.2fs", statistics.rollbackSeconds))
+    print(String(format: "  без черновика:      %d токенов за %.2fs",
+                 statistics.plainTokens, statistics.plainSeconds))
+    // Распределение принятого по раундам: «в среднем 1» может значить и «всегда 1»,
+    // и «то 0, то 5» — это разные диагнозы.
+    var histogram: [Int: Int] = [:]
+    for round in statistics.rounds { histogram[round.accepted, default: 0] += 1 }
+    let line = histogram.keys.sorted().map { "\($0):\(histogram[$0]!)" }.joined(separator: " ")
+    print("  принято→раундов:    \(line)")
+    // Сама последовательность: политике переключения важно, идут ли нули подряд.
+    print("  по раундам:         " + statistics.rounds.map { String($0.accepted) }.joined(separator: " "))
 }
 
 let (first, produced) = try run()
 report(first, "результат")
+
+// --control: та же генерация без спекуляции, по одному токену жадно. Спекулятивный
+// вывод обязан совпасть с ним токен в токен; расхождение — дефект проверки или отката,
+// а не «низкая приёмка».
+if arguments.contains("--control") {
+    let cache = try target.newCache(parameters: nil)
+    let controlStarted = Date()
+    var out = target(LMInput.Text(tokens: MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count)),
+                     cache: cache, state: nil)
+    eval(out.logits)
+    let controlPrefill = Date().timeIntervalSince(controlStarted)
+    let decodeStarted = Date()
+    var control: [Int] = []
+    var margins: [Float] = []
+    while control.count < maximumTokens {
+        let last = out.logits[0, -1].asType(.float32)
+        let top = sorted(last, axis: -1)[(-2)...].asArray(Float.self)
+        margins.append(top[1] - top[0])
+        let next = argMax(last, axis: -1).item(Int32.self)
+        control.append(Int(next))
+        if eos.contains(Int(next)) { break }
+        out = target(LMInput.Text(tokens: MLXArray([next]).reshaped(1, 1)), cache: cache, state: nil)
+    }
+    let controlDecode = Date().timeIntervalSince(decodeStarted)
+    let common = zip(produced, control).prefix { $0 == $1 }.count
+    print("")
+    print("=== контроль без спекуляции: \(control.count) токенов")
+    print(String(format: "  префилл %.2fs, декод %.2fs, токенов в секунду (декод): %.2f",
+                 controlPrefill, controlDecode, Double(control.count) / controlDecode))
+    let specDecode = first.seconds - first.prefillSeconds
+    print(String(format: "  спекулятивно (декод): %.2f tok/s — отношение %.2fx",
+                 Double(first.tokens) / specDecode,
+                 (Double(first.tokens) / specDecode) / (Double(control.count) / controlDecode)))
+    print("  совпало с начала:   \(common) из \(min(produced.count, control.count))"
+          + (common == min(produced.count, control.count) ? " — текст совпал" : " — РАСХОЖДЕНИЕ"))
+    if common < min(produced.count, control.count) {
+        // Отрыв первого логита от второго в точке расхождения: доли единицы — числовой
+        // шум разной ширины батча, единицы и больше — логика проверки или отката.
+        print(String(format: "  отрыв top1−top2 в точке расхождения: %.3f", margins[common]))
+        print("  спекулятивно: …" + context.tokenizer.decode(tokenIds: Array(produced[max(0, common - 10) ..< min(produced.count, common + 20)])))
+        print("  контроль:     …" + context.tokenizer.decode(tokenIds: Array(control[max(0, common - 10) ..< min(control.count, common + 20)])))
+    }
+}
 
 // Второй прогон того же промпта: с prefix-кэшем он должен попасть в снапшот и дать
 // тот же текст. Отличие в тексте значит, что восстановленное состояние не равно

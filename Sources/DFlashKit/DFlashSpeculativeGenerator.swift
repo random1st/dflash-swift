@@ -31,6 +31,10 @@ public struct DFlashGenerationStatistics: Sendable {
     public var verifySeconds: Double = 0
     public var rollbackSeconds: Double = 0
     public var prefillSeconds: Double = 0
+    /// Time in single-token forwards, taken while the gate had drafting switched off.
+    public var plainSeconds: Double = 0
+    /// Tokens committed without a draft. See ``SpeculationGate`` for when that happens.
+    public var plainTokens: Int = 0
 
     /// Prompt tokens that came from a prefix-cache hit instead of being prefilled.
     public var reusedPromptTokens: Int = 0
@@ -297,7 +301,38 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             adaptiveWidth ? min(SmallMQuantizedMatmul.rowsPerTile - 1, cap) : cap
         var acceptedTotal = 0
 
+        // Whether to draft at all is the same kind of question as how wide: measured
+        // per reply, not assumed. A pinned cap is a bench measuring one width and gets
+        // that width every round.
+        var gate = SpeculationGate()
+        var plainSeconds = 0.0
+        var plainTokens = 0
+
         while emitted.count < maximumTokens && !stopped {
+            if adaptiveWidth && gate.isPlain {
+                // One token per forward, greedy: the same output the verify loop would
+                // commit, without paying for a block the target is about to reject. The
+                // drafter's context cache still has to follow along - `advance` appends
+                // the rows the verified positions completed - so that when the gate lets
+                // drafting resume, the drafter sees the whole reply and not a hole.
+                let mark = Date()
+                let step = try advance(
+                    tokens: [pending], targetCache: targetCache, draftCache: draftCache,
+                    carried: pendingContext)
+                let next = argMax(step.logits[0, -1], axis: -1).item(Int.self)
+                plainSeconds += Date().timeIntervalSince(mark)
+                plainTokens += 1
+
+                cached.append(pending)
+                pendingContext = step.context
+                pending = next
+                emitted.append(next)
+                onToken(next)
+                stopped = stopTokens.contains(next)
+                gate.recordPlainToken()
+                continue
+            }
+
             let anchor = Int32(pending)
             // The block is [anchor] + mask slots; the drafter reads its logits at
             // the mask positions, which is why `selectBlock` drops the anchor row.
@@ -374,6 +409,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             if adaptiveWidth {
                 let mean = Double(acceptedTotal) / Double(rounds.count)
                 roundCap = Self.width(forAccepted: mean, blockDrafts: cap)
+                gate.recordRound(accepted: accepted)
             }
         }
 
@@ -393,6 +429,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         return DFlashGenerationStatistics(
             draftSeconds: draftSeconds, verifySeconds: verifySeconds,
             rollbackSeconds: rollbackSeconds, prefillSeconds: prefillSeconds,
+            plainSeconds: plainSeconds, plainTokens: plainTokens,
             reusedPromptTokens: reused,
             tokens: emitted.count, rounds: rounds, seconds: Date().timeIntervalSince(start))
     }
