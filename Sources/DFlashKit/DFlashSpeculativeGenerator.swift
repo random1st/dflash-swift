@@ -138,6 +138,14 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
     /// Zero means the verify pass is on stock kernels and the cap is the narrow one.
     public let acceleratedLayers: Int
 
+    /// Whether a round's verified rows form a tree instead of a single chain.
+    ///
+    /// Same rows, same weight sweep - only their shape changes. See
+    /// ``DFlashDraftTree`` for what that buys and why. On by default: the output is
+    /// the same greedy text either way, and measured against the chain it is faster
+    /// on every prompt tried. Off is for measuring the difference.
+    public let treeSpeculation: Bool
+
     /// Prompt prefixes kept hot between calls, or nil to prefill every prompt cold.
     public let prefixCache: PrefixCache?
 
@@ -166,11 +174,13 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         drafter: DFlashDraftModel,
         maximumDraftTokens: Int? = nil,
         useSmallMKernel: Bool = true,
-        prefixCache: PrefixCache? = nil
+        prefixCache: PrefixCache? = nil,
+        treeSpeculation: Bool = true
     ) {
         self.target = target
         self.drafter = drafter
         self.prefixCache = prefixCache
+        self.treeSpeculation = treeSpeculation
         // The tap order comes from the drafter's own config: any other order
         // silently mismatches `fc` and produces drafts the target rejects.
         self.bridge = Qwen35Bridge(
@@ -339,27 +349,61 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             let blockIds = [anchor] + Array(repeating: maskToken, count: blockSize - 1)
             let block = MLXArray(blockIds).reshaped(1, blockSize)
             var mark = Date()
-            let proposals = drafter.selectBlock(
-                block, fusedTargetHidden: pendingContext, cache: draftCache,
-                cap: roundCap, anchorId: anchor)
+            // A tree spends the same verified rows on several branches instead of one
+            // chain; `tree` is nil when that is switched off or when the checkpoint has
+            // no selector and therefore no lattice to branch over.
+            let tree =
+                treeSpeculation
+                ? drafter.draftLattice(
+                    block, fusedTargetHidden: pendingContext, cache: draftCache,
+                    cap: roundCap, anchorId: anchor
+                ).map {
+                    DFlashDraftTree.build(lattice: $0, anchorId: anchor, budget: roundCap)
+                } : nil
+            let proposals =
+                tree == nil
+                ? drafter.selectBlock(
+                    block, fusedTargetHidden: pendingContext, cache: draftCache,
+                    cap: roundCap, anchorId: anchor)
+                : nil
             // The draft is lazy until something forces it; without this the draft cost
             // would be charged to whichever phase happens to evaluate first.
-            eval(proposals)
+            if let proposals { eval(proposals) }
             draftSeconds += Date().timeIntervalSince(mark)
 
             mark = Date()
-            let verifyIds = concatenated([MLXArray([anchor]), proposals]).reshaped(1, roundCap + 1)
+            let width = tree?.rowCount ?? (roundCap + 1)
             var verifyState = bridge.requestState()
             verifyState[mtpGatedDeltaCaptureFlagKey] = true
+            if let tree { verifyState[mtpTreePlanKey] = tree.plan }
+            let verifyIds =
+                tree?.verifyIds
+                ?? concatenated([MLXArray([anchor]), proposals!]).reshaped(1, roundCap + 1)
             let verified = target(
                 LMInput.Text(tokens: verifyIds), cache: targetCache, state: verifyState)
 
-            let outcome = Self.acceptedPrefix(
-                targetLogits: verified.logits[0], proposals: proposals)
+            // Rows the round keeps if everything it proposed is handed out, anchor
+            // first. A chain keeps a prefix; a tree keeps the branch the target walked.
+            let keptRows: [Int]
+            let committed: [Int]
+            if let tree {
+                let targetTokens = argMax(verified.logits[0], axis: -1).asType(.int32)
+                eval(targetTokens)
+                let (rows, bonus) = tree.acceptedPath(
+                    targetTokens: targetTokens.asArray(Int32.self))
+                keptRows = rows
+                committed = rows.dropFirst().map { Int(tree.tokens[$0]) } + [Int(bonus)]
+            } else {
+                let outcome = Self.acceptedPrefix(
+                    targetLogits: verified.logits[0], proposals: proposals!)
+                keptRows = Array(0 ... outcome.accepted)
+                committed =
+                    outcome.proposals[0 ..< outcome.accepted] + [outcome.targetTokens[outcome.accepted]]
+            }
             verifySeconds += Date().timeIntervalSince(mark)
             mark = Date()
-            let accepted = outcome.accepted
-            rounds.append(DFlashRound(proposed: roundCap, accepted: accepted))
+            let accepted = keptRows.count - 1
+            rounds.append(DFlashRound(proposed: width - 1, accepted: accepted))
 
             guard let verifiedState = verified.state,
                 let verifiedFused = bridge.fuse(verifiedState)
@@ -367,8 +411,6 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
                 throw DFlashGenerationError.missingTapStates
             }
 
-            let committed =
-                outcome.proposals[0 ..< accepted] + [outcome.targetTokens[accepted]]
             var handed = 0
             for token in committed {
                 emitted.append(token)
@@ -391,17 +433,24 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             // tokens no later prompt contains.
             mark = Date()
             let keep = min(handed, accepted) + 1
-            rollbackGatedDeltaRound(
-                cache: targetCache,
-                captures: verified.state?[mtpGatedDeltaCapturesKey] ?? [],
-                width: roundCap + 1,
-                keep: keep)
+            let keepRows = Array(keptRows[..<keep])
+            let captures = verified.state?[mtpGatedDeltaCapturesKey] ?? []
+            if tree != nil {
+                rollbackGatedDeltaTree(
+                    cache: targetCache, captures: captures, width: width, keepRows: keepRows)
+            } else {
+                rollbackGatedDeltaRound(
+                    cache: targetCache, captures: captures, width: width, keep: keep)
+            }
             rollbackSeconds += Date().timeIntervalSince(mark)
 
             // Context for the next round: the rows of the positions that stayed.
-            pendingContext = verifiedFused[0..., ..<keep, 0...]
+            pendingContext =
+                tree == nil
+                ? verifiedFused[0..., ..<keep, 0...]
+                : take(verifiedFused, MLXArray(keepRows.map { Int32($0) }), axis: 1)
             cached.append(Int(anchor))
-            cached.append(contentsOf: outcome.proposals[0 ..< (keep - 1)])
+            cached.append(contentsOf: committed[0 ..< (keep - 1)])
 
             // Next round's width follows the hit rate this drafter is actually achieving
             // on these weights, which is the thing a fixed cap cannot know in advance.

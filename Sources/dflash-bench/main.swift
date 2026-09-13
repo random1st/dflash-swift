@@ -76,10 +76,15 @@ print("промпт: \(tokens.count) токенов")
 let capArgument = arguments.firstIndex(of: "--cap").flatMap { index -> Int? in
     arguments.count > index + 1 ? Int(arguments[index + 1]) : nil
 }
+// Раунд по умолчанию — дерево: те же строки верификации, та же развёртка весов, но
+// разложенные по ветвям. --chain возвращает старую одну цепочку, чтобы мерить разницу.
+let tree = !arguments.contains("--chain")
 let generator = DFlashSpeculativeGenerator(
     target: target, drafter: drafter, maximumDraftTokens: capArgument, useSmallMKernel: smallM,
-    prefixCache: arguments.contains("--prefix-cache") ? PrefixCache() : nil)
+    prefixCache: arguments.contains("--prefix-cache") ? PrefixCache() : nil,
+    treeSpeculation: tree)
 print("ядро small-M: заменено слоёв \(generator.acceleratedLayers)")
+print("форма раунда: \(tree ? "дерево" : "цепочка")")
 print("cap \(generator.cap) черновых токенов на раунд, генерирую \(maximumTokens)…")
 
 var eos = Set<Int>()
