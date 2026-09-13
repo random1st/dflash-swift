@@ -55,6 +55,17 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
+        .executableTarget(
+            name: "dflash-lattice",
+            dependencies: [
+                "DFlashKit",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
         .testTarget(
             name: "DFlashKitTests",
             dependencies: ["DFlashKit"],

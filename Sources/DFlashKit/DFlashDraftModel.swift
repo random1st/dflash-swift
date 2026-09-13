@@ -132,6 +132,49 @@ public final class DFlashDraftModel: Module {
         return out
     }
 
+    /// Backbone forward plus the output head, restricted to the block's mask slots.
+    ///
+    /// A padded output head would let a candidate id index past the real
+    /// vocabulary and gather garbage codebook rows, hence the trim.
+    private func blockLogits(
+        _ block: MLXArray, fusedTargetHidden: MLXArray, cache: [BaseKVCache], cap: Int
+    ) -> (hidden: MLXArray, logits: MLXArray) {
+        guard let target else {
+            fatalError("DFlashDraftModel.bind(_:) must be called before drafting")
+        }
+        let hidden = forwardHidden(
+            block, fusedTargetHidden: fusedTargetHidden, cache: cache, logitsStart: 1)[0][..<cap]
+        return (hidden, target.logits(hidden)[0..., ..<configuration.vocabularySize])
+    }
+
+    /// Scores every transition in the block without choosing a path through them.
+    ///
+    /// ``selectBlock(_:fusedTargetHidden:cache:cap:anchorId:)`` walks this greedily and
+    /// keeps one token per slot. A caller that wants to keep more than one branch - or
+    /// to measure how often the target's token sat in a branch the walk did not take -
+    /// needs the scores themselves. Returns nil for a DFlash 1 checkpoint, which has no
+    /// selector and so no transitions to score.
+    ///
+    /// Runs the same forward and the same candidate selection as `selectBlock`, so what
+    /// it reports is what the walk actually saw.
+    public func draftLattice(
+        _ block: MLXArray, fusedTargetHidden: MLXArray, cache: [BaseKVCache],
+        cap: Int, anchorId: Int32
+    ) -> DFlashBlockLattice? {
+        guard let selector else { return nil }
+        let (hidden, logits) = blockLogits(
+            block, fusedTargetHidden: fusedTargetHidden, cache: cache, cap: cap)
+
+        let k = selector.topK
+        let partitioned = argPartition(logits, kth: logits.dim(-1) - k, axis: -1)
+        let candidateIds = partitioned[0..., (logits.dim(-1) - k)...].asType(.int32)
+        let unary = transformUnary(takeAlong(logits, candidateIds, axis: -1))
+        let scores = selector.lattice(
+            candidateIds: candidateIds, unaryLogits: unary, hidden: hidden, anchorId: anchorId)
+        return DFlashBlockLattice(
+            candidateIds: candidateIds, scores: scores, unaryLogits: unary)
+    }
+
     /// Drafts one block greedily.
     ///
     /// - Parameters:
@@ -144,27 +187,39 @@ public final class DFlashDraftModel: Module {
         _ block: MLXArray, fusedTargetHidden: MLXArray, cache: [BaseKVCache],
         cap: Int, anchorId: Int32
     ) -> MLXArray {
-        guard let target else {
-            fatalError("DFlashDraftModel.bind(_:) must be called before drafting")
-        }
-        let hidden = forwardHidden(
-            block, fusedTargetHidden: fusedTargetHidden, cache: cache, logitsStart: 1)[0][..<cap]
-
-        // A padded output head would let a candidate id index past the real
-        // vocabulary and gather garbage codebook rows.
-        let logits = target.logits(hidden)[0..., ..<configuration.vocabularySize]
-
         guard let selector else {
             // DFlash 1: no selector, each slot takes its own argmax.
+            let (_, logits) = blockLogits(
+                block, fusedTargetHidden: fusedTargetHidden, cache: cache, cap: cap)
             return argMax(logits, axis: -1).asType(.int32)
         }
 
-        let k = selector.topK
-        let partitioned = argPartition(logits, kth: logits.dim(-1) - k, axis: -1)
-        let candidateIds = partitioned[0..., (logits.dim(-1) - k)...].asType(.int32)
-        let unary = transformUnary(takeAlong(logits, candidateIds, axis: -1))
-        let scores = selector.lattice(
-            candidateIds: candidateIds, unaryLogits: unary, hidden: hidden, anchorId: anchorId)
-        return selector.walkGreedy(scores: scores, candidateIds: candidateIds)
+        guard
+            let lattice = draftLattice(
+                block, fusedTargetHidden: fusedTargetHidden, cache: cache, cap: cap,
+                anchorId: anchorId)
+        else {
+            fatalError("a checkpoint with a selector always produces a lattice")
+        }
+        return selector.walkGreedy(scores: lattice.scores, candidateIds: lattice.candidateIds)
     }
+}
+
+/// One drafted block before a path is chosen through it.
+///
+/// The drafter predicts every slot in parallel, so what it really produces is a lattice:
+/// K candidates per slot and a score for every transition between adjacent slots. Greedy
+/// decoding collapses that to a single chain; the lattice is what a tree would branch
+/// over.
+public struct DFlashBlockLattice {
+    /// `[slots, K]` candidate token ids per mask slot.
+    public let candidateIds: MLXArray
+    /// `[slots, K predecessors, K candidates]` transition scores, fp32. Slot 0's
+    /// predecessor rows are all the anchor, so they are identical to one another.
+    public let scores: MLXArray
+    /// `[slots, K]` the drafter's own transformed logits at those candidates - the half
+    /// of the score that does not depend on the predecessor. Kept separate because the
+    /// balance between it and the bilinear transition term is a trained constant, and
+    /// the only way to ask whether that balance is right is to reweigh the two halves.
+    public let unaryLogits: MLXArray
 }
