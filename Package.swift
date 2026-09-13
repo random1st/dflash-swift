@@ -33,6 +33,18 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "dflash-train",
+            dependencies: [
+                "DFlashKit",
+                .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ]
+        ),
+        .executableTarget(
             name: "dflash-bench",
             dependencies: [
                 "DFlashKit",
