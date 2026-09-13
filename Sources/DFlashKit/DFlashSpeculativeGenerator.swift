@@ -18,10 +18,13 @@ public struct DFlashRound: Sendable {
     public let proposed: Int
     /// How many of them matched the target's own argmax.
     public let accepted: Int
+    /// Whether those rows formed a tree rather than a single chain.
+    public let tree: Bool
 
-    public init(proposed: Int, accepted: Int) {
+    public init(proposed: Int, accepted: Int, tree: Bool = false) {
         self.proposed = proposed
         self.accepted = accepted
+        self.tree = tree
     }
 }
 
@@ -52,6 +55,10 @@ public struct DFlashGenerationStatistics: Sendable {
         guard !rounds.isEmpty else { return 0 }
         return Double(rounds.reduce(0) { $0 + $1.accepted }) / Double(rounds.count)
     }
+
+    /// How many rounds took a tree. Reported so the shape that actually ran can be
+    /// read off a benchmark instead of inferred from tok/s, which drifts here.
+    public var treeRounds: Int { rounds.filter(\.tree).count }
 }
 
 public enum DFlashGenerationEvent: Sendable {
@@ -140,10 +147,18 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
 
     /// Whether a round's verified rows form a tree instead of a single chain.
     ///
-    /// Same rows, same weight sweep - only their shape changes. See
-    /// ``DFlashDraftTree`` for what that buys and why. On by default: the output is
-    /// the same greedy text either way, and measured against the chain it is faster
-    /// on every prompt tried. Off is for measuring the difference.
+    /// Same rows, same weight sweep - only their shape changes, and the committed
+    /// text is the same greedy text either way. See ``DFlashDraftTree`` for what
+    /// the tree buys. Off by default because whether it buys anything depends on
+    /// the target's weights, not on the code: with the same DFlash2 drafter the
+    /// tree takes 10% fewer target forwards against stock Qwen3.8-27B (461 to 415
+    /// over eight prompts) and 13% *more* against the abliterated variant of those
+    /// weights (125 to 141 over four), which is the model actually served. Where
+    /// the chain already accepts 3.5 or more of its 7 slots, cutting the trunk to
+    /// pay for branches loses. A per-reply policy that tried both shapes and kept
+    /// the better one was measured and discarded: interleaving the shapes within
+    /// one reply biases both estimates, and it came out below the fixed chain on
+    /// the abliterated weights and below the fixed tree on stock.
     public let treeSpeculation: Bool
 
     /// Prompt prefixes kept hot between calls, or nil to prefill every prompt cold.
@@ -175,7 +190,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         maximumDraftTokens: Int? = nil,
         useSmallMKernel: Bool = true,
         prefixCache: PrefixCache? = nil,
-        treeSpeculation: Bool = true
+        treeSpeculation: Bool = false
     ) {
         self.target = target
         self.drafter = drafter
@@ -403,7 +418,8 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             verifySeconds += Date().timeIntervalSince(mark)
             mark = Date()
             let accepted = keptRows.count - 1
-            rounds.append(DFlashRound(proposed: width - 1, accepted: accepted))
+            rounds.append(
+                DFlashRound(proposed: width - 1, accepted: accepted, tree: tree != nil))
 
             guard let verifiedState = verified.state,
                 let verifiedFused = bridge.fuse(verifiedState)

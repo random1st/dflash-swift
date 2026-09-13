@@ -76,9 +76,10 @@ print("промпт: \(tokens.count) токенов")
 let capArgument = arguments.firstIndex(of: "--cap").flatMap { index -> Int? in
     arguments.count > index + 1 ? Int(arguments[index + 1]) : nil
 }
-// Раунд по умолчанию — дерево: те же строки верификации, та же развёртка весов, но
-// разложенные по ветвям. --chain возвращает старую одну цепочку, чтобы мерить разницу.
-let tree = !arguments.contains("--chain")
+// Раунд по умолчанию — цепочка, как в генераторе. --tree раскладывает те же строки
+// верификации по ветвям: быстрее на стоковых весах, медленнее на abliterated — см.
+// документацию к `treeSpeculation`.
+let tree = arguments.contains("--tree")
 let generator = DFlashSpeculativeGenerator(
     target: target, drafter: drafter, maximumDraftTokens: capArgument, useSmallMKernel: smallM,
     prefixCache: arguments.contains("--prefix-cache") ? PrefixCache() : nil,
@@ -104,6 +105,17 @@ func report(_ statistics: DFlashGenerationStatistics, _ label: String) {
     print("  токенов:            \(statistics.tokens)")
     print("  раундов:            \(statistics.rounds.count)")
     print(String(format: "  принято на раунд:   %.2f", statistics.meanAcceptedPerRound))
+    // Какая форма реально шла, а не какая просилась: --tree на драфтере без
+    // селектора молча даёт цепочку, а устаревший бинарь — ту форму, что была при
+    // сборке. Из tok/s этого не вывести, он на этой машине гуляет в разы.
+    let treeRounds = statistics.treeRounds
+    let shape =
+        treeRounds == 0
+        ? "цепочка"
+        : (treeRounds == statistics.rounds.count
+            ? "дерево"
+            : "смешанно, дерево в \(treeRounds) из \(statistics.rounds.count)")
+    print("  форма раундов:      \(shape)")
     let widths = statistics.rounds.map(\.proposed)
     if let lo = widths.min(), let hi = widths.max() {
         let mean = Double(widths.reduce(0, +)) / Double(max(widths.count, 1))
