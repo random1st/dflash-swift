@@ -18,8 +18,22 @@ import MLXNN
 /// speculation nets nothing. The weights are read once; the cost should be flat.
 ///
 /// This kernel makes it flat. An 8x8 `simdgroup_matrix` MMA tile covers M <= 8 exactly,
-/// so every quantised weight group is read and dequantised ONCE and reused by all rows;
-/// K is split across the 8 simdgroups of a threadgroup so each serial loop is short.
+/// so every quantised weight group is read ONCE and reused by all rows; K is split across
+/// the 8 simdgroups of a threadgroup so each serial loop is short.
+///
+/// The weights are never dequantised. Each lane keeps its column's 64-value group in
+/// registers and feeds the RAW quantised integers into the MMA as bf16 - which is exact,
+/// since a 4- or 8-bit integer fits bf16's 8 significant bits - accumulating
+/// `T = sum(q * x)` per group. The affine map is applied once per group on the fragment:
+/// `C += s * T + b * sum(x)`, with `sum(x)` taken from the B fragment as it goes past.
+/// For 4-bit the integer is built by OR-ing the nibble into the bf16 bit pattern of 128
+/// (`0x4300 | q` = 128 + q), so the bias term becomes `b - 128 s`; one OR instead of a
+/// convert, multiply and add per weight. No threadgroup staging, no barriers in the K loop.
+/// Measured on an isolated chain of the 27B's six projection shapes (M=8, vs the M=1
+/// weight-streaming floor of 43.6 ms): stock 151 ms, the earlier dequant-to-threadgroup
+/// version 90-94 ms, this 55.5 ms. The MMA work itself is ~34 ms at this GPU's bf16 peak,
+/// so at eight rows the kernel is close to compute-bound, not memory-bound; that is why
+/// the register form had to drop every instruction it could.
 ///
 /// It is a supplement, never a replacement: below M=5 `quantizedMatmul`'s GEMV path is
 /// already at roofline and wins. Anything outside the eligibility window falls through
@@ -43,53 +57,157 @@ enum SmallMQuantizedMatmul {
     /// multiple of 512. Upstream gates on 128, which would mis-handle K in
     /// {128, 256, 384} mod 512; every real shape here is a multiple of 512 anyway.
     static let inputFeatureMultiple = 512
-    /// The group size the kernel's dequant loop hard-codes (one scale/bias per 64).
+    /// The group size the kernel's K loop hard-codes (one scale/bias per 64).
     static let requiredGroupSize = 64
 
     private static let threadgroupSize = 256  // 8 simdgroups
 
-    // The dequant unpack is the only part that differs by quantisation width: 4-bit
-    // packs 8 values per uint32 (16 values = 2 uints per lane-slice), 8-bit packs 4
-    // (16 values = 4 uints). Split-K, staging, MMA and reduction are identical.
-    private static let unpack: [Int: String] = [
-        4: """
-                        const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
-                        uint p0 = wr[0], p1 = wr[1];
-                        for (int t = 0; t < 8; ++t)
-                            bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
-                        for (int t = 0; t < 8; ++t)
-                            bt[(kq * 16 + 8 + t) * 8 + j] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
-            """,
-        8: """
-                        const device uint* wr = w + (size_t)n * (K / 4) + (ka >> 2) + kq * 4;
-                        for (int u = 0; u < 4; ++u) {
-                            uint p = wr[u];
-                            for (int t = 0; t < 4; ++t)
-                                bt[(kq * 16 + u * 4 + t) * 8 + j] =
-                                    (bfloat16_t)((float)((p >> (8 * t)) & 255u) * s + bb);
-                        }
-            """,
+    /// Output columns per threadgroup. Four MMA column tiles share one load of the x
+    /// fragment. Measured on the chain: 16 columns 60.6 ms (x traffic re-paid), 32 columns
+    /// 55.5 ms, 48 columns 77.7 ms and 64 columns 99.6 ms (the per-lane weight registers
+    /// spill to the stack). Thirty-two is the knee.
+    private static let columnTiles = 4
+    private static let columnsPerThreadgroup = 32
+
+    /// How a quantisation width lays its 64-value group out in memory and how a lane turns
+    /// its two packed values into MMA operands. Everything else is shared.
+    private struct Width {
+        /// 16-byte words per column per group: 4-bit packs 64 nibbles into 2, 8-bit 64
+        /// bytes into 4. A lane loads them all - contiguous, one `uint4` per instruction.
+        let uint4PerGroup: Int
+        /// The weight row stride and the group offset, in `uint`s.
+        let rowStride: String
+        let groupOffset: String
+        /// Bit position of the lane's first value inside its `uint`.
+        let firstShift: String
+        let shiftStep: Int
+        /// The `uint` holding values `kt * 8 + fn` and `fn + 1` of column tile `c`, given
+        /// the words `q<c>0 ... q<c>k` (each a `uint4`).
+        let word: (_ c: Int, _ kt: Int) -> String
+        /// The value's bf16 encoding as an MMA operand, exact for the full range.
+        let element: (_ shift: String) -> String
+        /// What that encoding adds to the true value (0 or 128), folded into the bias.
+        let offset: Int
+    }
+
+    private static let widths: [Int: Width] = [
+        // A nibble OR-ed into bf16 128's bit pattern is exactly 128 + q. The lane's
+        // values are at nibbles fn, fn+1 of uint kt.
+        4: Width(
+            uint4PerGroup: 2, rowStride: "(K / 8)", groupOffset: "(ka >> 3)",
+            firstShift: "4u * (uint)fn", shiftStep: 4,
+            word: { c, kt in "q\(c)\(kt / 4)[\(kt % 4)]" },
+            element: { "as_type<bfloat16_t>((ushort)(0x4300u | ((p >> \($0)) & 15u)))" },
+            offset: 128),
+        // A byte converts to bf16 exactly (8 significant bits). Values kt*8+fn, +1 sit in
+        // bytes fn&3, fn&3 + 1 of uint 2*kt + (fn >> 2); the two candidate words are
+        // constant-indexed registers and the pick is one select.
+        8: Width(
+            uint4PerGroup: 4, rowStride: "(K / 4)", groupOffset: "(ka >> 2)",
+            firstShift: "8u * (uint)(fn & 3)", shiftStep: 8,
+            word: { c, kt in
+                "((fn >> 2) ? q\(c)\((2 * kt + 1) / 4)[\((2 * kt + 1) % 4)] : q\(c)\((2 * kt) / 4)[\((2 * kt) % 4)])"
+            },
+            element: { "(bfloat16_t)(float)((p >> \($0)) & 255u)" },
+            offset: 0),
     ]
 
-    /// The kernel body, in a one-tile and a two-tile form.
+    /// The kernel body for one quantisation width and one or two row tiles.
     ///
-    /// Both read and dequantise the weights exactly once; the second tile only adds another
-    /// `simdgroup_multiply_accumulate` against the same `B`. That is the whole point - the
-    /// weight traffic is what decode is bound by, so sixteen rows cost what eight do plus
-    /// the arithmetic nobody notices.
-    private static func source(tiles: Int) -> String {
-        let secondTileMMA =
-            tiles == 2
-            ? """
-                            simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);
-                            simdgroup_multiply_accumulate(C1, A1, B, C1);
+    /// The weight tile is the MMA's A operand (rows = output columns, cols = k) and x is
+    /// loaded transposed as B, so the accumulator is `C^T[n][m]`; that is what lets each
+    /// lane's A fragment be the two adjacent packed values it already holds. A second row
+    /// tile is another transposed load of x rows 8..15 and another MMA against the same A -
+    /// the weight traffic is what decode is bound by, so sixteen rows cost what eight do
+    /// plus arithmetic.
+    ///
+    /// The kt loop is unrolled in the generator rather than by pragma so every register
+    /// index is a literal: an indexed register array spills to the stack, and that alone
+    /// was 88 ms against 62 ms on the chain.
+    private static func source(rowTiles: Int, width: Width) -> String {
+        let cs = 0 ..< columnTiles
+        let rs = 0 ..< rowTiles
+        let ws = 0 ..< width.uint4PerGroup
+        func lines(_ parts: [String]) -> String { parts.joined(separator: "\n") }
+
+        let accumulators = lines(cs.flatMap { c in
+            rs.map { r in "    simdgroup_matrix<float, 8, 8> C\(c)_\(r) = simdgroup_matrix<float, 8, 8>(0);" }
+        })
+        let groupRegisters = lines(cs.map { c in
+            "    uint4 " + ws.map { "q\(c)\($0)" }.joined(separator: ", ") + "; float s\(c), bb\(c);"
+        })
+        let groupLoads = lines(cs.map { c in
+            """
+                    {
+                        int n = n0 + \(c) * 8 + fm;
+                        if (n < N) {
+                            const device uint4* wr = reinterpret_cast<const device uint4*>(
+                                w + (size_t)n * \(width.rowStride) + \(width.groupOffset));
+            \(lines(ws.map { "                q\(c)\($0) = wr[\($0)];" }))
+                            s\(c)  = (float)sc[(size_t)n * (K / 64) + (ka >> 6)];
+                            bb\(c) = (float)bi[(size_t)n * (K / 64) + (ka >> 6)];
+                        } else {
+            \(lines(ws.map { "                q\(c)\($0) = uint4(0);" }))
+                            s\(c) = 0.0f; bb\(c) = 0.0f;
+                        }
+                    }
+            """
+        })
+        let groupAccumulators = lines(cs.flatMap { c in
+            rs.map { r in "        simdgroup_matrix<float, 8, 8> T\(c)_\(r) = simdgroup_matrix<float, 8, 8>(0);" }
+        })
+        let xSums = lines(rs.map { r in "        float xa0_\(r) = 0.0f, xa1_\(r) = 0.0f;" })
+        let bDeclare = rs.map { "B\($0)" }.joined(separator: ", ")
+
+        // One MMA step: 8 values of k for every row tile and column tile.
+        let steps = lines((0 ..< 8).map { kt in
+            let bLoads = lines(rs.map { r in
                 """
-            : ""
-        let secondTileDeclare =
-            tiles == 2 ? "simdgroup_matrix<float, 8, 8> C1 = simdgroup_matrix<float, 8, 8>(0);" : ""
-        let secondTileStore =
-            tiles == 2 ? "simdgroup_store(C1, red + 512 + sg * 64, 8);" : ""
-        let secondTileLoad = tiles == 2 ? "simdgroup_matrix<bfloat16_t, 8, 8> A1;" : ""
+                        simdgroup_load(B\(r), x + (size_t)\(r) * 8 * K + ka + \(kt * 8), K, ulong2(0, 0), true);
+                        {
+                            thread vec<bfloat16_t, 2>& be = reinterpret_cast<thread vec<bfloat16_t, 2>&>(B\(r).thread_elements());
+                            xa0_\(r) += (float)be[0];
+                            xa1_\(r) += (float)be[1];
+                        }
+                """
+            })
+            let mmas = lines(cs.map { c in
+                """
+                        {
+                            uint p = \(width.word(c, kt));
+                            thread vec<bfloat16_t, 2>& e = reinterpret_cast<thread vec<bfloat16_t, 2>&>(A.thread_elements());
+                            e[0] = \(width.element("sh0"));
+                            e[1] = \(width.element("sh1"));
+                \(lines(rs.map { r in "            simdgroup_multiply_accumulate(T\(c)_\(r), A, B\(r), T\(c)_\(r));" }))
+                        }
+                """
+            })
+            return bLoads + "\n" + mmas
+        })
+        let xSumReduce = lines(rs.map { r in
+            """
+                    xa0_\(r) += simd_shuffle_xor(xa0_\(r), 2); xa0_\(r) += simd_shuffle_xor(xa0_\(r), 4); xa0_\(r) += simd_shuffle_xor(xa0_\(r), 16);
+                    xa1_\(r) += simd_shuffle_xor(xa1_\(r), 2); xa1_\(r) += simd_shuffle_xor(xa1_\(r), 4); xa1_\(r) += simd_shuffle_xor(xa1_\(r), 16);
+            """
+        })
+        let applyAffine = lines(cs.flatMap { c in
+            rs.map { r in
+                """
+                        {
+                            thread vec<float, 2>& ce = reinterpret_cast<thread vec<float, 2>&>(C\(c)_\(r).thread_elements());
+                            thread vec<float, 2>& te = reinterpret_cast<thread vec<float, 2>&>(T\(c)_\(r).thread_elements());
+                            float b2 = bb\(c) - \(width.offset).0f * s\(c);
+                            ce[0] += s\(c) * te[0] + b2 * xa0_\(r);
+                            ce[1] += s\(c) * te[1] + b2 * xa1_\(r);
+                        }
+                """
+            }
+        })
+        let stores = lines(cs.flatMap { c in
+            rs.map { r in
+                "    simdgroup_store(C\(c)_\(r), red + ((sg * \(columnTiles) + \(c)) * \(rowTiles) + \(r)) * 64, 8);"
+            }
+        })
 
         return """
             const int K = KD, N = ND, M = MD;
@@ -99,65 +217,50 @@ enum SmallMQuantizedMatmul {
             uint tgid = threadgroup_position_in_grid.x;
             uint sg   = tid >> 5;
             uint lane = tid & 31;
+            int n0 = (int)tgid * \(columnsPerThreadgroup);
 
-            int n0 = (int)tgid * 8;                 // one threadgroup -> 8 output columns
+            // The lane's position in an 8x8 fragment (MLX steel's layout): row fm, columns
+            // fn and fn + 1. For A that is weight column n0 + 8c + fm at k = kt * 8 + fn.
+            int qid = (int)lane / 4;
+            int fm = (qid & 4) + (((int)lane / 2) % 4);
+            int fn = (qid & 2) * 2 + ((int)lane % 2) * 2;
+            uint sh0 = \(width.firstShift), sh1 = sh0 + \(width.shiftStep)u;
 
-            // x is read straight from device into the MMA (bf16 in, fp32 accumulate): no
-            // staging keeps threadgroup memory small and, more importantly, the critical
-            // path short.
-            threadgroup bfloat16_t bs[8 * 512];     // per-simdgroup 64k x 8n dequant stage
-            threadgroup float red[8 * 64 * \(tiles)];   // cross-simdgroup reduction
+            threadgroup float red[8 * \(columnTiles) * \(rowTiles) * 64];   // cross-simdgroup reduction
+        \(accumulators)
+        \(groupRegisters)
 
-            simdgroup_matrix<float, 8, 8> C0 = simdgroup_matrix<float, 8, 8>(0);
-            \(secondTileDeclare)
-            threadgroup bfloat16_t* bt = bs + sg * 512;
-
-            // Split-K: the 8 simdgroups each walk 1/8 of K in short serial loops. (A prior
-            // revision walked all of K per threadgroup and put ~160 barrier pairs on the
-            // critical path.)
+            // Split-K: the 8 simdgroups each walk 1/8 of K in short serial loops, one
+            // 64-value quantisation group per iteration, and never synchronise inside it.
             int kbeg = (int)sg * KPS;
             for (int kk = 0; kk < KPS; kk += 64) {
                 int ka = kbeg + kk;
-                int j  = (int)(lane & 7);
-                int kq = (int)(lane >> 3);
-                int n  = n0 + j;
-                if (n < N) {
-                    // dequantize per quantization group (64 values), not per MMA tile (8):
-                    // one scale/bias load serves the whole group and barriers drop 8x.
-                    int g = ka >> 6;
-                    float s  = (float)sc[(size_t)n * (K / 64) + g];
-                    float bb = (float)bi[(size_t)n * (K / 64) + g];
-        __UNPACK__
-                } else {
-                    for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-
-                simdgroup_matrix<bfloat16_t, 8, 8> A0, B;
-                \(secondTileLoad)
-                for (int kt = 0; kt < 8; ++kt) {
-                    simdgroup_load(B, bt + kt * 64, 8);
-                    simdgroup_load(A0, x + ka + kt * 8, K);   // x rows 0..7
-                    simdgroup_multiply_accumulate(C0, A0, B, C0);
-        \(secondTileMMA)
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+        \(groupLoads)
+        \(groupAccumulators)
+        \(xSums)
+                simdgroup_matrix<bfloat16_t, 8, 8> A, \(bDeclare);
+        \(steps)
+                // sum(x) over the group for the lane's two m columns: lanes sharing fn
+                // differ in bits 1, 2 and 4 of the lane index.
+        \(xSumReduce)
+        \(applyAffine)
             }
 
-            simdgroup_store(C0, red + sg * 64, 8);
-            \(secondTileStore)
+        \(stores)
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // sum the 8 split-K partials and write out
-            for (int i = (int)tid; i < 64 * \(tiles); i += 256) {
-                int t = i >> 6;                     // which MMA tile
-                int r = i & 63;                     // position inside it
-                int m = t * 8 + (r >> 3);
-                int j = r & 7;
-                int n = n0 + j;
+            // sum the 8 split-K partials and write out; the fragments are C^T, so
+            // position r inside a tile is (column r >> 3, row r & 7).
+            for (int i = (int)tid; i < \(columnTiles * rowTiles) * 64; i += \(threadgroupSize)) {
+                int t = i >> 6;
+                int c = t / \(rowTiles);
+                int rt = t % \(rowTiles);
+                int r = i & 63;
+                int m = rt * 8 + (r & 7);
+                int n = n0 + c * 8 + (r >> 3);
                 if (m < M && n < N) {
                     float v = 0.0f;
-                    for (int q = 0; q < 8; ++q) v += red[t * 512 + q * 64 + r];
+                    for (int q = 0; q < 8; ++q) v += red[((q * \(columnTiles) + c) * \(rowTiles) + rt) * 64 + r];
                     out[(size_t)m * N + n] = (bfloat16_t)v;
                 }
             }
@@ -165,7 +268,7 @@ enum SmallMQuantizedMatmul {
     }
 
     /// JIT compilation is per kernel object, so each (width, tile count) pair is built once
-    /// and held: two quantisation widths by one or two tiles.
+    /// and held: two quantisation widths by one or two row tiles.
     private struct Variant: Hashable {
         let bits: Int
         let tiles: Int
@@ -173,14 +276,13 @@ enum SmallMQuantizedMatmul {
 
     private static let kernels: [Variant: MLX.MLXFast.MLXFastKernel] = {
         var built: [Variant: MLX.MLXFast.MLXFastKernel] = [:]
-        for (bits, body) in unpack {
+        for (bits, width) in widths {
             for tiles in 1 ... 2 {
                 built[Variant(bits: bits, tiles: tiles)] = MLX.MLXFast.metalKernel(
-                    name: "dflash_qmm_mma_\(bits)_\(tiles)",
+                    name: "dflash_qmm_fold_\(bits)_\(tiles)",
                     inputNames: ["x", "w", "sc", "bi"],
                     outputNames: ["out"],
-                    source: source(tiles: tiles)
-                        .replacingOccurrences(of: "__UNPACK__", with: body))
+                    source: source(rowTiles: tiles, width: width))
             }
         }
         return built
@@ -192,7 +294,7 @@ enum SmallMQuantizedMatmul {
     /// is answered once when the model is swapped rather than per forward.
     static func isEligible(_ layer: QuantizedLinear) -> Bool {
         guard layer.mode == .affine, layer.biases != nil else { return false }
-        guard unpack[layer.bits] != nil, layer.groupSize == requiredGroupSize else {
+        guard widths[layer.bits] != nil, layer.groupSize == requiredGroupSize else {
             return false
         }
         let (outputFeatures, inputFeatures) = layer.shape
@@ -217,7 +319,10 @@ enum SmallMQuantizedMatmul {
         return kernel(
             [x, weight, scales, biases],
             template: [("KD", inputFeatures), ("ND", outputFeatures), ("MD", rows)],
-            grid: (((outputFeatures + 7) / 8) * threadgroupSize, 1, 1),
+            grid: (
+                ((outputFeatures + columnsPerThreadgroup - 1) / columnsPerThreadgroup)
+                    * threadgroupSize, 1, 1
+            ),
             threadGroup: (threadgroupSize, 1, 1),
             outputShapes: [[rows, outputFeatures]],
             outputDTypes: [.bfloat16])[0]
