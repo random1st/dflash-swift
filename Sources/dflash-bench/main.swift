@@ -80,12 +80,15 @@ let capArgument = arguments.firstIndex(of: "--cap").flatMap { index -> Int? in
 // верификации по ветвям: быстрее на стоковых весах, медленнее на abliterated — см.
 // документацию к `treeSpeculation`.
 let tree = arguments.contains("--tree")
+// --ngram включает догадки на одиночных шагах. Измерено и проиграло, см. doc у
+// `ngramLookup`; флаг остался, чтобы перемерить на другом тексте или другой модели.
+let ngram = arguments.contains("--ngram")
 let generator = DFlashSpeculativeGenerator(
     target: target, drafter: drafter, maximumDraftTokens: capArgument, useSmallMKernel: smallM,
     prefixCache: arguments.contains("--prefix-cache") ? PrefixCache() : nil,
-    treeSpeculation: tree)
+    treeSpeculation: tree, ngramLookup: ngram)
 print("ядро small-M: заменено слоёв \(generator.acceleratedLayers)")
-print("форма раунда: \(tree ? "дерево" : "цепочка")")
+print("форма раунда: \(tree ? "дерево" : "цепочка"), n-gram на одиночных шагах: \(ngram ? "да" : "нет")")
 print("cap \(generator.cap) черновых токенов на раунд, генерирую \(maximumTokens)…")
 
 var eos = Set<Int>()
@@ -130,6 +133,10 @@ func report(_ statistics: DFlashGenerationStatistics, _ label: String) {
     print(String(format: "  откат:              %.2fs", statistics.rollbackSeconds))
     print(String(format: "  без черновика:      %d токенов за %.2fs",
                  statistics.plainTokens, statistics.plainSeconds))
+    // Попаданий n-gram на одиночных шагах: безубыточность около 10%, потому что
+    // вторая строка forward'а стоит +4.8 мс из 45.8.
+    print(String(format: "  n-gram:             %d догадок, %d попаданий",
+                 statistics.ngramGuesses, statistics.ngramHits))
     // Распределение принятого по раундам: «в среднем 1» может значить и «всегда 1»,
     // и «то 0, то 5» — это разные диагнозы.
     var histogram: [Int: Int] = [:]

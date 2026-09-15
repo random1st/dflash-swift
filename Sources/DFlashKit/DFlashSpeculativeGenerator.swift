@@ -38,6 +38,10 @@ public struct DFlashGenerationStatistics: Sendable {
     public var plainSeconds: Double = 0
     /// Tokens committed without a draft. See ``SpeculationGate`` for when that happens.
     public var plainTokens: Int = 0
+    /// Plain steps that carried an n-gram guess, and how many of those guesses the
+    /// target accepted. See ``NgramTable``.
+    public var ngramGuesses: Int = 0
+    public var ngramHits: Int = 0
 
     /// Prompt tokens that came from a prefix-cache hit instead of being prefilled.
     public var reusedPromptTokens: Int = 0
@@ -161,6 +165,23 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
     /// the abliterated weights and below the fixed tree on stock.
     public let treeSpeculation: Bool
 
+    /// Whether plain steps verify an n-gram guess alongside the pending token.
+    ///
+    /// The plain phase is where the drafter has given up, and on the abliterated 27B it
+    /// is a third of the tokens and nearly half the time, every one of them a single-row
+    /// forward at the memory floor. A guess from ``NgramTable`` rides in the same forward
+    /// as a second row, and the committed text stays the greedy text, because the guess
+    /// goes through the same accept test as a drafted block.
+    ///
+    /// Off by default because it was measured and lost. ABBA on five prompts against
+    /// Qwen3.8-27B-Uncensored: the text is identical, the plain phase is slower on every
+    /// prompt. Hit rates were 4, 10, 30, 15 and 7 percent, and a miss costs more than
+    /// the 4.8 ms second row predicts - 7 to 25 ms once the accept sync and the rollback
+    /// of 48 recurrent layers are paid - so break-even sits at 15 to 35 percent. The
+    /// plain phase is plain because the text there is unpredictable; a lookup table is a
+    /// weaker predictor than the drafter that already gave up on it.
+    public let ngramLookup: Bool
+
     /// Prompt prefixes kept hot between calls, or nil to prefill every prompt cold.
     public let prefixCache: PrefixCache?
 
@@ -190,12 +211,14 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         maximumDraftTokens: Int? = nil,
         useSmallMKernel: Bool = true,
         prefixCache: PrefixCache? = nil,
-        treeSpeculation: Bool = false
+        treeSpeculation: Bool = false,
+        ngramLookup: Bool = false
     ) {
         self.target = target
         self.drafter = drafter
         self.prefixCache = prefixCache
         self.treeSpeculation = treeSpeculation
+        self.ngramLookup = ngramLookup
         // The tap order comes from the drafter's own config: any other order
         // silently mismatches `fc` and produces drafts the target rejects.
         self.bridge = Qwen35Bridge(
@@ -303,6 +326,31 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         var pending = argMax(prefill.logits[0, -1], axis: -1).item(Int.self)
         var emitted = [pending]
         onToken(pending)
+        var stopped = stopTokens.contains(pending)
+
+        // Everything the reply has said so far, prompt included, for the plain steps'
+        // guesses. Kept in step by `hand`, which is the only place tokens are committed.
+        var table = NgramTable(tokens: prompt)
+        table.append(pending)
+
+        /// Commits verified tokens in order until a stop token or the budget cuts the
+        /// list short; returns how many were handed out.
+        func hand(_ committed: [Int]) -> Int {
+            var handed = 0
+            for token in committed {
+                emitted.append(token)
+                handed += 1
+                onToken(token)
+                table.append(token)
+                pending = token
+                if stopTokens.contains(token) {
+                    stopped = true
+                    break
+                }
+                if emitted.count >= maximumTokens { break }
+            }
+            return handed
+        }
 
         // What the caches hold, which is not what was emitted: a round commits its anchor
         // and its accepted drafts, while the bonus token it emits only enters the cache as
@@ -315,7 +363,6 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         var verifySeconds = 0.0
         var rollbackSeconds = 0.0
         let prefillSeconds = Date().timeIntervalSince(start)
-        var stopped = stopTokens.contains(pending)
 
         // Start at one tile and grow, rather than starting at the whole block. A drafter
         // that matches its target climbs back to the full block within a few rounds, and
@@ -332,15 +379,62 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
         var gate = SpeculationGate()
         var plainSeconds = 0.0
         var plainTokens = 0
+        var ngramGuesses = 0
+        var ngramHits = 0
 
         while emitted.count < maximumTokens && !stopped {
             if adaptiveWidth && gate.isPlain {
+                let mark = Date()
+                if ngramLookup, let guess = table.guess() {
+                    // The guess rides as a second row of the same forward and takes the
+                    // same accept test as a drafted block, so the committed text is still
+                    // the greedy text; a miss costs the extra row, a hit saves a forward.
+                    // Two rows stay on the stock kernels - the small-M path starts at six.
+                    let anchor = pending
+                    var verifyState = bridge.requestState()
+                    verifyState[mtpGatedDeltaCaptureFlagKey] = true
+                    let verifyIds = MLXArray([Int32(anchor), Int32(guess)]).reshaped(1, 2)
+                    let verified = target(
+                        LMInput.Text(tokens: verifyIds), cache: targetCache, state: verifyState)
+                    let outcome = Self.acceptedPrefix(
+                        targetLogits: verified.logits[0], proposals: MLXArray([Int32(guess)]))
+                    guard let verifiedState = verified.state,
+                        let verifiedFused = bridge.fuse(verifiedState)
+                    else {
+                        throw DFlashGenerationError.missingTapStates
+                    }
+                    ngramGuesses += 1
+                    ngramHits += outcome.accepted
+
+                    let handed = hand(
+                        outcome.proposals[0 ..< outcome.accepted]
+                            + [outcome.targetTokens[outcome.accepted]])
+                    let keep = min(handed, outcome.accepted) + 1
+                    rollbackGatedDeltaRound(
+                        cache: targetCache,
+                        captures: verified.state?[mtpGatedDeltaCapturesKey] ?? [],
+                        width: 2, keep: keep)
+                    // The rows carried in are not in the drafter's cache yet - nothing ran
+                    // the drafter this step - so they stay in front of the new ones. Dropping
+                    // them leaves the target's text unchanged and the drafter's context one
+                    // row short per step, which showed up as fewer accepted drafts on the
+                    // same reply once drafting resumed.
+                    pendingContext = concatenated(
+                        [pendingContext, verifiedFused[0..., ..<keep, 0...]], axis: 1)
+                    cached.append(anchor)
+                    if keep > 1 { cached.append(guess) }
+
+                    plainSeconds += Date().timeIntervalSince(mark)
+                    plainTokens += handed
+                    for _ in 0 ..< handed { gate.recordPlainToken() }
+                    continue
+                }
+
                 // One token per forward, greedy: the same output the verify loop would
                 // commit, without paying for a block the target is about to reject. The
                 // drafter's context cache still has to follow along - `advance` appends
                 // the rows the verified positions completed - so that when the gate lets
                 // drafting resume, the drafter sees the whole reply and not a hole.
-                let mark = Date()
                 let step = try advance(
                     tokens: [pending], targetCache: targetCache, draftCache: draftCache,
                     carried: pendingContext)
@@ -350,10 +444,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
 
                 cached.append(pending)
                 pendingContext = step.context
-                pending = next
-                emitted.append(next)
-                onToken(next)
-                stopped = stopTokens.contains(next)
+                _ = hand([next])
                 gate.recordPlainToken()
                 continue
             }
@@ -427,18 +518,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
                 throw DFlashGenerationError.missingTapStates
             }
 
-            var handed = 0
-            for token in committed {
-                emitted.append(token)
-                handed += 1
-                onToken(token)
-                pending = token
-                if stopTokens.contains(token) {
-                    stopped = true
-                    break
-                }
-                if emitted.count >= maximumTokens { break }
-            }
+            let handed = hand(committed)
 
             // Roll the target back to the tokens that were actually handed out, which is
             // usually [anchor + accepted] - the bonus token is the target's own next
@@ -495,6 +575,7 @@ public final class DFlashSpeculativeGenerator: @unchecked Sendable {
             draftSeconds: draftSeconds, verifySeconds: verifySeconds,
             rollbackSeconds: rollbackSeconds, prefillSeconds: prefillSeconds,
             plainSeconds: plainSeconds, plainTokens: plainTokens,
+            ngramGuesses: ngramGuesses, ngramHits: ngramHits,
             reusedPromptTokens: reused,
             tokens: emitted.count, rounds: rounds, seconds: Date().timeIntervalSince(start))
     }
